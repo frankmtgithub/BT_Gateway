@@ -1,0 +1,272 @@
+{% extends "base.html" %}
+{% block title %}Pairing{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+    <!-- Pairing Controls -->
+    <div class="col-12">
+        <div class="card border-warning">
+            <div class="card-header bg-warning bg-opacity-25 d-flex justify-content-between align-items-center">
+                <h5 class="mb-0"><i class="bi bi-broadcast"></i> Pairing Mode</h5>
+                <span class="badge bg-secondary fs-6" id="pairing-status-badge">OFF</span>
+            </div>
+            <div class="card-body">
+                <p class="text-muted mb-3">
+                    When pairing mode is enabled, the gateway becomes discoverable and
+                    accepts pairing requests from nearby Bluetooth devices.
+                </p>
+                <div class="d-flex gap-2">
+                    <button class="btn btn-success" id="enable-pairing-btn">
+                        <i class="bi bi-broadcast"></i> Enable Pairing
+                    </button>
+                    <button class="btn btn-secondary" id="disable-pairing-btn">
+                        <i class="bi bi-stop-circle"></i> Disable Pairing
+                    </button>
+                    <button class="btn btn-outline-primary ms-auto" id="refresh-devices-btn">
+                        <i class="bi bi-arrow-clockwise"></i> Refresh
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Discovered Devices -->
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-search"></i> Discovered Devices</h5>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Address</th>
+                                <th>Paired</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="discovered-tbody">
+                            <tr>
+                                <td colspan="4" class="text-muted text-center py-4">
+                                    Enable pairing mode and wait for devices to appear.
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Paired Devices Management -->
+    <div class="col-12">
+        <div class="card border-danger">
+            <div class="card-header bg-danger bg-opacity-25 d-flex justify-content-between align-items-center">
+                <h5 class="mb-0"><i class="bi bi-link-45deg"></i> Paired Devices</h5>
+                <button class="btn btn-sm btn-outline-danger" id="remove-all-btn">
+                    <i class="bi bi-trash"></i> Remove All
+                </button>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0">
+                        <thead>
+                            <tr>
+                                <th>Connection Name</th>
+                                <th>Address</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="paired-tbody">
+                            <tr>
+                                <td colspan="3" class="text-muted text-center py-4">
+                                    No paired devices.
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Rename Modal -->
+<div class="modal fade" id="renameModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Rename Device</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="rename-address">
+                <div class="mb-3">
+                    <label for="rename-input" class="form-label">Connection Name</label>
+                    <input type="text" class="form-control" id="rename-input"
+                           placeholder="e.g. connection1">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" id="rename-save-btn">Save</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const enableBtn = document.getElementById('enable-pairing-btn');
+    const disableBtn = document.getElementById('disable-pairing-btn');
+    const refreshBtn = document.getElementById('refresh-devices-btn');
+    const removeAllBtn = document.getElementById('remove-all-btn');
+    const renameSaveBtn = document.getElementById('rename-save-btn');
+
+    enableBtn.addEventListener('click', function() {
+        fetch('/api/pairing/enable', {method: 'POST'})
+            .then(r => r.json())
+            .then(() => {
+                document.getElementById('pairing-status-badge').textContent = 'ON';
+                document.getElementById('pairing-status-badge').className = 'badge bg-success fs-6';
+                refreshDiscovered();
+            });
+    });
+
+    disableBtn.addEventListener('click', function() {
+        fetch('/api/pairing/disable', {method: 'POST'})
+            .then(r => r.json())
+            .then(() => {
+                document.getElementById('pairing-status-badge').textContent = 'OFF';
+                document.getElementById('pairing-status-badge').className = 'badge bg-secondary fs-6';
+            });
+    });
+
+    refreshBtn.addEventListener('click', refreshDiscovered);
+    removeAllBtn.addEventListener('click', function() {
+        if (confirm('Remove ALL paired devices? This will disconnect all active connections.')) {
+            fetch('/api/pairing/remove-all', {method: 'POST'})
+                .then(r => r.json())
+                .then(() => { refreshDiscovered(); refreshPaired(); });
+        }
+    });
+
+    renameSaveBtn.addEventListener('click', function() {
+        const addr = document.getElementById('rename-address').value;
+        const name = document.getElementById('rename-input').value.trim();
+        if (!name) return;
+        const urlAddr = addr.replace(/:/g, '-');
+        fetch('/api/devices/' + urlAddr + '/rename', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: name})
+        }).then(r => r.json()).then(() => {
+            bootstrap.Modal.getInstance(document.getElementById('renameModal')).hide();
+            refreshPaired();
+        });
+    });
+
+    // Check current pairing mode
+    fetch('/api/pairing/mode').then(r => r.json()).then(data => {
+        const badge = document.getElementById('pairing-status-badge');
+        if (data.enabled) {
+            badge.textContent = 'ON';
+            badge.className = 'badge bg-success fs-6';
+        }
+    });
+
+    refreshDiscovered();
+    refreshPaired();
+    setInterval(refreshDiscovered, 5000);
+    setInterval(refreshPaired, 10000);
+});
+
+function refreshDiscovered() {
+    fetch('/api/pairing/devices')
+        .then(r => r.json())
+        .then(devices => {
+            const tbody = document.getElementById('discovered-tbody');
+            if (!devices.length) {
+                tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-4">No devices discovered yet.</td></tr>';
+                return;
+            }
+            tbody.innerHTML = devices.map(d => `
+                <tr>
+                    <td>${escHtml(d.name)}</td>
+                    <td class="font-monospace">${escHtml(d.address)}</td>
+                    <td>${d.paired ? '<span class="badge bg-success">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td>
+                    <td>
+                        ${d.paired ? '' : `<button class="btn btn-sm btn-outline-success" onclick="pairDevice('${d.address}')"><i class="bi bi-link"></i> Pair</button>`}
+                    </td>
+                </tr>
+            `).join('');
+        });
+}
+
+function refreshPaired() {
+    fetch('/api/status')
+        .then(r => r.json())
+        .then(data => {
+            const tbody = document.getElementById('paired-tbody');
+            const devices = data.devices || {};
+            const entries = Object.entries(devices);
+            if (!entries.length) {
+                tbody.innerHTML = '<tr><td colspan="3" class="text-muted text-center py-4">No paired devices.</td></tr>';
+                return;
+            }
+            tbody.innerHTML = entries.map(([addr, info]) => `
+                <tr>
+                    <td>${escHtml(info.name)}</td>
+                    <td class="font-monospace">${escHtml(addr)}</td>
+                    <td>
+                        <button class="btn btn-sm btn-outline-primary me-1"
+                                onclick="openRename('${addr}', '${escHtml(info.name)}')">
+                            <i class="bi bi-pencil"></i>
+                        </button>
+                        <button class="btn btn-sm btn-outline-danger"
+                                onclick="removeDevice('${addr}')">
+                            <i class="bi bi-trash"></i>
+                        </button>
+                    </td>
+                </tr>
+            `).join('');
+        });
+}
+
+function pairDevice(address) {
+    fetch('/api/pairing/pair', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({address: address})
+    }).then(r => r.json()).then(data => {
+        if (data.error) alert('Pairing failed: ' + data.error);
+        else { refreshDiscovered(); refreshPaired(); }
+    });
+}
+
+function removeDevice(address) {
+    if (!confirm('Remove device ' + address + '?')) return;
+    fetch('/api/pairing/remove', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({address: address})
+    }).then(r => r.json()).then(() => { refreshDiscovered(); refreshPaired(); });
+}
+
+function openRename(address, currentName) {
+    document.getElementById('rename-address').value = address;
+    document.getElementById('rename-input').value = currentName;
+    new bootstrap.Modal(document.getElementById('renameModal')).show();
+}
+
+function escHtml(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+}
+</script>
+{% endblock %}

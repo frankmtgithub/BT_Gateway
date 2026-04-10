@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  bt-gateway:
+    build: .
+    container_name: bt-gateway
+    restart: unless-stopped
+
+    # Bluetooth requires privileged access to the host hardware
+    privileged: true
+    network_mode: host
+
+    volumes:
+      # Persistent configuration
+      - bt-gateway-data:/data
+      # Host D-Bus system bus (required for BlueZ communication)
+      - /var/run/dbus:/var/run/dbus
+
+    environment:
+      - CONFIG_PATH=/data/config.json
+      - LOG_LEVEL=INFO
+
+volumes:
+  bt-gateway-data:

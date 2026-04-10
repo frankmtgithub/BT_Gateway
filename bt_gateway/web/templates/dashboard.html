@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+    <!-- PLC Status Card -->
+    <div class="col-12">
+        <div class="card border-info" id="plc-card">
+            <div class="card-header bg-info bg-opacity-25 d-flex justify-content-between align-items-center">
+                <h5 class="mb-0"><i class="bi bi-cpu"></i> PLC Connection</h5>
+                <span class="badge bg-secondary fs-6" id="plc-status-badge">--</span>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    <div class="col-md-4">
+                        <strong>Status:</strong>
+                        <span id="plc-status-text" class="ms-2">--</span>
+                    </div>
+                    <div class="col-md-4">
+                        <strong>Address:</strong>
+                        <span id="plc-address" class="ms-2 font-monospace">--</span>
+                    </div>
+                    <div class="col-md-4">
+                        <strong>Adapter:</strong>
+                        <span id="plc-adapter" class="ms-2 font-monospace">--</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Devices Section -->
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="mb-0"><i class="bi bi-phone"></i> Connected Devices</h5>
+                <span class="badge bg-primary" id="device-count">0</span>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0" id="devices-table">
+                        <thead>
+                            <tr>
+                                <th>Status</th>
+                                <th>Name</th>
+                                <th>Address</th>
+                            </tr>
+                        </thead>
+                        <tbody id="devices-tbody">
+                            <tr>
+                                <td colspan="3" class="text-muted text-center py-4">
+                                    No devices configured. Go to
+                                    <a href="/pairing">Pairing</a> to add devices.
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Message Log -->
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="mb-0"><i class="bi bi-journal-text"></i> Message Log</h5>
+                <button class="btn btn-sm btn-outline-secondary" id="clear-log-btn">Clear</button>
+            </div>
+            <div class="card-body p-0">
+                <div id="message-log" class="font-monospace small p-3"
+                     style="max-height:300px;overflow-y:auto;background:#1a1a2e;">
+                    <div class="text-muted">Waiting for messages...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    // Initial status load
+    fetchStatus();
+
+    // Periodic refresh
+    setInterval(fetchStatus, 5000);
+
+    document.getElementById('clear-log-btn').addEventListener('click', function() {
+        document.getElementById('message-log').innerHTML =
+            '<div class="text-muted">Log cleared.</div>';
+    });
+});
+</script>
+{% endblock %}

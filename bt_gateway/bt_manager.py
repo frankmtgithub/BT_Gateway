@@ -1,0 +1,228 @@
+"""Bluetooth adapter management via BlueZ D-Bus API.
+
+Provides adapter enumeration, property control, discovery, and pairing
+through the BlueZ D-Bus interfaces (Adapter1, Device1, etc.).
+"""
+
+import logging
+import threading
+
+import dbus
+import dbus.mainloop.glib
+from gi.repository import GLib
+
+logger = logging.getLogger(__name__)
+
+BLUEZ_SERVICE = "org.bluez"
+ADAPTER_IFACE = "org.bluez.Adapter1"
+DEVICE_IFACE = "org.bluez.Device1"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
+OM_IFACE = "org.freedesktop.DBus.ObjectManager"
+
+
+class BluetoothManager:
+    """Manages BlueZ adapters, discovery, and pairing via D-Bus."""
+
+    def __init__(self):
+        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+        self._bus = dbus.SystemBus()
+        self._loop = GLib.MainLoop()
+        self._loop_thread = None
+        self._discovering = False
+        self._discovery_adapter_path = None
+
+    def start(self):
+        """Start the GLib main loop in a background thread for D-Bus signals."""
+        if self._loop_thread is None or not self._loop_thread.is_alive():
+            self._loop_thread = threading.Thread(
+                target=self._loop.run, daemon=True, name="glib-mainloop"
+            )
+            self._loop_thread.start()
+            logger.info("GLib main loop started")
+
+    def stop(self):
+        if self._loop.is_running():
+            self._loop.quit()
+            logger.info("GLib main loop stopped")
+
+    def list_adapters(self):
+        """Return a list of available BT adapters with their properties.
+
+        Returns:
+            list of dict: [{"path": "/org/bluez/hci0", "name": "hci0",
+                            "address": "AA:BB:...", "powered": True}, ...]
+        """
+        adapters = []
+        try:
+            om = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, "/"), OM_IFACE
+            )
+            objects = om.GetManagedObjects()
+            for path, interfaces in objects.items():
+                if ADAPTER_IFACE in interfaces:
+                    props = interfaces[ADAPTER_IFACE]
+                    adapters.append({
+                        "path": str(path),
+                        "name": str(path).split("/")[-1],
+                        "address": str(props.get("Address", "")),
+                        "powered": bool(props.get("Powered", False)),
+                        "discoverable": bool(props.get("Discoverable", False)),
+                        "pairable": bool(props.get("Pairable", False)),
+                        "alias": str(props.get("Alias", "")),
+                    })
+        except dbus.DBusException as e:
+            logger.error("Failed to list adapters: %s", e)
+        return adapters
+
+    def get_adapter_address(self, adapter_name):
+        """Get the BT address of a named adapter (e.g. 'hci0')."""
+        for adapter in self.list_adapters():
+            if adapter["name"] == adapter_name:
+                return adapter["address"]
+        return None
+
+    def get_adapter_path(self, adapter_name):
+        return f"/org/bluez/{adapter_name}"
+
+    def set_adapter_property(self, adapter_name, prop, value):
+        """Set a property on an adapter (e.g. Powered, Discoverable, Pairable)."""
+        path = self.get_adapter_path(adapter_name)
+        try:
+            props = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, path), PROPS_IFACE
+            )
+            if isinstance(value, bool):
+                value = dbus.Boolean(value)
+            props.Set(ADAPTER_IFACE, prop, value)
+            logger.info("Set %s.%s = %s", adapter_name, prop, value)
+            return True
+        except dbus.DBusException as e:
+            logger.error("Failed to set %s on %s: %s", prop, adapter_name, e)
+            return False
+
+    def power_adapter(self, adapter_name, on=True):
+        return self.set_adapter_property(adapter_name, "Powered", on)
+
+    def set_discoverable(self, adapter_name, discoverable=True, timeout=0):
+        """Make adapter discoverable. timeout=0 means indefinite."""
+        self.set_adapter_property(adapter_name, "DiscoverableTimeout", dbus.UInt32(timeout))
+        return self.set_adapter_property(adapter_name, "Discoverable", discoverable)
+
+    def set_pairable(self, adapter_name, pairable=True, timeout=0):
+        self.set_adapter_property(adapter_name, "PairableTimeout", dbus.UInt32(timeout))
+        return self.set_adapter_property(adapter_name, "Pairable", pairable)
+
+    def start_discovery(self, adapter_name):
+        """Start device discovery on the given adapter."""
+        path = self.get_adapter_path(adapter_name)
+        try:
+            adapter = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, path), ADAPTER_IFACE
+            )
+            adapter.StartDiscovery()
+            self._discovering = True
+            self._discovery_adapter_path = path
+            logger.info("Discovery started on %s", adapter_name)
+            return True
+        except dbus.DBusException as e:
+            logger.error("Failed to start discovery on %s: %s", adapter_name, e)
+            return False
+
+    def stop_discovery(self, adapter_name):
+        path = self.get_adapter_path(adapter_name)
+        try:
+            adapter = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, path), ADAPTER_IFACE
+            )
+            adapter.StopDiscovery()
+            self._discovering = False
+            self._discovery_adapter_path = None
+            logger.info("Discovery stopped on %s", adapter_name)
+            return True
+        except dbus.DBusException as e:
+            logger.error("Failed to stop discovery on %s: %s", adapter_name, e)
+            return False
+
+    def list_devices(self, adapter_name=None):
+        """List all known BT devices, optionally filtered to one adapter.
+
+        Returns:
+            list of dict with keys: path, address, name, paired, connected, trusted, adapter
+        """
+        devices = []
+        try:
+            om = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, "/"), OM_IFACE
+            )
+            objects = om.GetManagedObjects()
+            for path, interfaces in objects.items():
+                if DEVICE_IFACE in interfaces:
+                    props = interfaces[DEVICE_IFACE]
+                    dev_adapter = str(props.get("Adapter", ""))
+                    if adapter_name and not dev_adapter.endswith(adapter_name):
+                        continue
+                    devices.append({
+                        "path": str(path),
+                        "address": str(props.get("Address", "")),
+                        "name": str(props.get("Name", props.get("Alias", "Unknown"))),
+                        "paired": bool(props.get("Paired", False)),
+                        "connected": bool(props.get("Connected", False)),
+                        "trusted": bool(props.get("Trusted", False)),
+                        "adapter": dev_adapter.split("/")[-1],
+                    })
+        except dbus.DBusException as e:
+            logger.error("Failed to list devices: %s", e)
+        return devices
+
+    def pair_device(self, device_address, adapter_name=None):
+        """Initiate pairing with a device by its BT address."""
+        device_path = self._find_device_path(device_address, adapter_name)
+        if not device_path:
+            logger.error("Device %s not found", device_address)
+            return False
+        try:
+            device = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, device_path), DEVICE_IFACE
+            )
+            device.Pair()
+            # Trust the device so it can reconnect without user confirmation
+            props = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, device_path), PROPS_IFACE
+            )
+            props.Set(DEVICE_IFACE, "Trusted", dbus.Boolean(True))
+            logger.info("Paired and trusted device %s", device_address)
+            return True
+        except dbus.DBusException as e:
+            logger.error("Failed to pair with %s: %s", device_address, e)
+            return False
+
+    def remove_device(self, device_address, adapter_name=None):
+        """Remove (unpair) a device."""
+        device_path = self._find_device_path(device_address, adapter_name)
+        if not device_path:
+            logger.error("Device %s not found for removal", device_address)
+            return False
+        # Get the adapter path from the device path
+        adapter_path = "/".join(device_path.split("/")[:-1])
+        try:
+            adapter = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, adapter_path), ADAPTER_IFACE
+            )
+            adapter.RemoveDevice(device_path)
+            logger.info("Removed device %s", device_address)
+            return True
+        except dbus.DBusException as e:
+            logger.error("Failed to remove %s: %s", device_address, e)
+            return False
+
+    def _find_device_path(self, device_address, adapter_name=None):
+        """Find the D-Bus object path for a device by its BT address."""
+        devices = self.list_devices(adapter_name)
+        for dev in devices:
+            if dev["address"].upper() == device_address.upper():
+                return dev["path"]
+        return None
+
+    @property
+    def bus(self):
+        return self._bus
