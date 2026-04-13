@@ -199,11 +199,18 @@ def api_plc_status():
     if adapter:
         paired = current_app.bt_manager.get_single_paired_device(adapter)
     plc_conn = current_app.plc_connection
+    effective_channel = 0
+    if plc_conn is not None:
+        effective_channel = int(getattr(plc_conn, "channel", 0) or 0)
     return jsonify({
         "adapter": adapter,
         "paired": paired,
         "status": plc_conn.status if plc_conn else "disconnected",
-        "channel": current_app.gateway_config.get("plc_channel", 1),
+        # Configured override (0 = auto-discover).
+        "channel": int(current_app.gateway_config.get("plc_channel", 0) or 0),
+        # Actual channel currently in use (discovered from the PLC's SDP).
+        "effective_channel": effective_channel,
+        "com_port": current_app.gateway_config.get("plc_com_port", ""),
         "port": current_app.gateway_config.get("plc_port", 0),
     })
 
@@ -294,7 +301,8 @@ def api_settings_get():
     return jsonify({
         "plc_adapter": cfg.get("plc_adapter", ""),
         "device_adapter": cfg.get("device_adapter", ""),
-        "plc_channel": cfg.get("plc_channel", 1),
+        "plc_channel": int(cfg.get("plc_channel", 0) or 0),
+        "plc_com_port": cfg.get("plc_com_port", ""),
         "plc_port": cfg.get("plc_port", 0),
         "plc_reconnect_interval": cfg.get("plc_reconnect_interval", 5),
         "web_port": cfg.get("web_port", 8080),
@@ -309,7 +317,7 @@ def api_settings_update():
 
     allowed = [
         "plc_adapter", "device_adapter",
-        "plc_channel", "plc_port", "plc_reconnect_interval",
+        "plc_channel", "plc_com_port", "plc_port", "plc_reconnect_interval",
     ]
     for key in allowed:
         if key in data:
@@ -319,6 +327,9 @@ def api_settings_update():
                     value = int(value)
                 except (TypeError, ValueError):
                     continue
+            elif key == "plc_com_port":
+                # Accept either "COM6" or "6" — store as a short label.
+                value = str(value or "").strip()
             cfg.set(key, value)
 
     return jsonify({"status": "saved"})

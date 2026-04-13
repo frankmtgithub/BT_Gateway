@@ -224,9 +224,13 @@ class MessageRouter:
         """Build a full status dict for the web UI."""
         plc_status = "disconnected"
         plc_address = ""
+        plc_effective_channel = 0
         if self._plc_connection:
             plc_status = self._plc_connection.status
             plc_address = getattr(self._plc_connection, "address", "") or ""
+            plc_effective_channel = int(
+                getattr(self._plc_connection, "channel", 0) or 0
+            )
 
         devices_status = {}
         config_devices = self._config.get_devices()
@@ -246,7 +250,15 @@ class MessageRouter:
                 "status": plc_status,
                 "address": plc_address,
                 "adapter": self._config.get("plc_adapter", ""),
-                "channel": self._config.get("plc_channel", 1),
+                # Configured override (0 = auto-discover via SDP).
+                "channel": int(self._config.get("plc_channel", 0) or 0),
+                # Actual channel used for the current/last connection —
+                # this is the one discovered from the PLC's SDP record.
+                "effective_channel": plc_effective_channel,
+                # Windows-side COM port the user opened (informational,
+                # doesn't affect the connection, just helps the user tie
+                # the Pi-side status back to "my Hercules on COM6").
+                "com_port": self._config.get("plc_com_port", ""),
                 "port": self._config.get("plc_port", 0),
             },
             "devices": devices_status,

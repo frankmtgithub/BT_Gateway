@@ -5,11 +5,17 @@ through the BlueZ D-Bus interfaces (Adapter1, Device1, etc.).
 """
 
 import logging
+import re
+import shutil
+import subprocess
 import threading
 
 import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
+
+SPP_UUID_SHORT = "1101"
+SPP_UUID = "00001101-0000-1000-8000-00805f9b34fb"
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +311,77 @@ class BluetoothManager:
         for dev in devices:
             if dev["address"].upper() == device_address.upper():
                 return dev["path"]
+        return None
+
+    # ── SDP service discovery ───────────────────────────────────────────
+
+    def sdp_find_spp_channel(self, device_address, timeout=10):
+        """Browse SDP on a remote device and return the SPP RFCOMM channel.
+
+        This is what lets the PLC connection work without the user having to
+        hand-type an RFCOMM channel number: Windows (or whatever is hosting
+        the PLC's SPP server) advertises the Serial Port service on some
+        channel, and we read that channel out of the SDP record.
+
+        Returns the channel number as int, or None if discovery failed /
+        no Serial Port record was found.
+        """
+        if not shutil.which("sdptool"):
+            logger.warning("sdptool not available; cannot auto-discover "
+                           "SPP channel on %s", device_address)
+            return None
+
+        # `sdptool search --bdaddr <addr> SP` restricts to Serial Port.
+        # Falls back to `browse` if `search` fails for some reason.
+        outputs = []
+        for args in (["sdptool", "search", "--bdaddr", device_address, "SP"],
+                     ["sdptool", "browse", device_address]):
+            try:
+                result = subprocess.run(
+                    args, capture_output=True, text=True, timeout=timeout,
+                )
+            except (OSError, subprocess.TimeoutExpired) as e:
+                logger.warning("%s failed for %s: %s", args[1], device_address, e)
+                continue
+            if result.returncode == 0 and result.stdout:
+                outputs.append(result.stdout)
+                channel = self._parse_spp_channel(result.stdout)
+                if channel is not None:
+                    return channel
+            else:
+                logger.debug("sdptool %s on %s exit=%d stderr=%s",
+                             args[1], device_address, result.returncode,
+                             result.stderr.strip())
+
+        if outputs:
+            logger.info("No SPP record found in SDP output for %s", device_address)
+        return None
+
+    @staticmethod
+    def _parse_spp_channel(sdp_output):
+        """Parse ``sdptool browse/search`` output for the SPP channel.
+
+        sdptool emits one "Service RecHandle" block per service.  We find
+        blocks whose Service Class ID List contains the Serial Port UUID
+        (0x1101) and return the first RFCOMM "Channel: N" we see in such
+        a block.
+        """
+        channel_re = re.compile(r"Channel:\s*(\d+)")
+        records = re.split(r"(?m)^Service RecHandle:", sdp_output)
+        for record in records:
+            is_spp = (
+                "0x1101" in record
+                or "Serial Port" in record
+                or SPP_UUID in record.lower()
+            )
+            if not is_spp:
+                continue
+            match = channel_re.search(record)
+            if match:
+                try:
+                    return int(match.group(1))
+                except ValueError:
+                    continue
         return None
 
     @property

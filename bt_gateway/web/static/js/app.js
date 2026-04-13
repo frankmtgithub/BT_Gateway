@@ -71,10 +71,17 @@ function updateDashboard(data) {
         const addrEl = document.getElementById('plc-address');
         const adapterEl = document.getElementById('plc-adapter');
         const portEl = document.getElementById('plc-port');
+        const comEl = document.getElementById('plc-com-port');
+        const chanEl = document.getElementById('plc-channel');
         if (addrEl) addrEl.textContent = data.plc.address || 'Not paired';
         if (adapterEl) adapterEl.textContent = data.plc.adapter || 'Not configured';
         if (portEl) portEl.textContent = data.plc.port != null
             ? '/dev/rfcomm' + data.plc.port : '--';
+        if (comEl) comEl.textContent = data.plc.com_port || '(not set)';
+        if (chanEl) {
+            const eff = parseInt(data.plc.effective_channel);
+            chanEl.textContent = eff > 0 ? ('Channel ' + eff) : '--';
+        }
     }
 
     if (typeof data.debug_mode === 'boolean') {

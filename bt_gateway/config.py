@@ -18,7 +18,14 @@ PORT_MAX = 30
 DEFAULT_CONFIG = {
     "plc_adapter": "",
     "device_adapter": "",
-    "plc_channel": 1,
+    # 0 means "auto-discover via SDP on every connect attempt".  Non-zero
+    # forces that channel number and skips the SDP lookup — used as an
+    # escape hatch if SDP browsing doesn't work against the PLC.
+    "plc_channel": 0,
+    # Purely informational label for the Windows-side COM port the user
+    # opened on the PLC (e.g. "COM6").  Not used by the connection logic —
+    # the actual RFCOMM channel comes from SDP discovery.
+    "plc_com_port": "",
     "plc_port": 0,
     "plc_reconnect_interval": 5,
     "web_host": "0.0.0.0",

@@ -56,16 +56,49 @@
                     </div>
                 </div>
                 <div class="mb-3">
-                    <label for="plc-channel-input" class="form-label">RFCOMM Channel</label>
-                    <input type="number" class="form-control" id="plc-channel-input"
-                           value="1" min="1" max="30">
+                    <label for="plc-com-port-input" class="form-label">
+                        PLC Listening COM Port
+                    </label>
+                    <input type="text" class="form-control" id="plc-com-port-input"
+                           placeholder="e.g. COM6" maxlength="16">
+                    <small class="text-muted">
+                        The Windows COM port the PLC is listening on (for your
+                        reference). The gateway auto-discovers the matching
+                        RFCOMM channel from the PLC's SDP record — see the
+                        <em>active channel</em> below.
+                    </small>
                 </div>
                 <div class="mb-3">
-                    <label for="plc-port-input" class="form-label">COM Port</label>
+                    <label class="form-label">Active RFCOMM Channel</label>
+                    <div class="input-group">
+                        <span class="input-group-text font-monospace" id="plc-effective-channel-display">
+                            (not connected)
+                        </span>
+                        <span class="input-group-text text-muted small">
+                            discovered via SDP
+                        </span>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label for="plc-channel-input" class="form-label">
+                        RFCOMM Channel Override
+                    </label>
+                    <input type="number" class="form-control" id="plc-channel-input"
+                           value="0" min="0" max="30">
+                    <small class="text-muted">
+                        Leave at <code>0</code> to auto-discover via SDP. Set a
+                        number to force a specific channel when discovery fails.
+                    </small>
+                </div>
+                <div class="mb-3">
+                    <label for="plc-port-input" class="form-label">
+                        Pi-side rfcomm Reservation
+                    </label>
                     <select class="form-select" id="plc-port-input"></select>
                     <small class="text-muted">
-                        Port number (<code>/dev/rfcommN</code>) reserved for the PLC
-                        connection.  Released back to the OS if the PLC is unpaired.
+                        Port number (<code>/dev/rfcommN</code>) reserved on the Pi
+                        so device connections can't grab it. Released when the
+                        PLC is unpaired.
                     </small>
                 </div>
                 <div class="mb-3">
@@ -258,7 +291,9 @@ function loadSettings() {
             // populated. loadAdapters reads savedSettings to make the
             // pre-selection stick once the options exist.
             savedSettings = cfg || {};
-            document.getElementById('plc-channel-input').value = cfg.plc_channel || 1;
+            document.getElementById('plc-channel-input').value =
+                Number.isFinite(cfg.plc_channel) ? cfg.plc_channel : 0;
+            document.getElementById('plc-com-port-input').value = cfg.plc_com_port || '';
             document.getElementById('plc-reconnect-input').value = cfg.plc_reconnect_interval || 5;
 
             // Fill the PLC COM port selector with available ports + the current one
@@ -305,10 +340,16 @@ function escAttr(s) {
 }
 
 function saveSettings() {
+    const channelOverrideRaw = document.getElementById('plc-channel-input').value;
+    const channelOverride = parseInt(channelOverrideRaw);
     const data = {
         plc_adapter: document.getElementById('plc-adapter-select').value,
         device_adapter: document.getElementById('device-adapter-select').value,
-        plc_channel: parseInt(document.getElementById('plc-channel-input').value) || 1,
+        // 0 = auto-discover via SDP (the normal case). Only non-zero values
+        // force a manual override.
+        plc_channel: Number.isFinite(channelOverride) && channelOverride >= 0
+            ? channelOverride : 0,
+        plc_com_port: document.getElementById('plc-com-port-input').value.trim(),
         plc_port: parseInt(document.getElementById('plc-port-input').value),
         plc_reconnect_interval: parseInt(document.getElementById('plc-reconnect-input').value) || 5,
     };
@@ -347,6 +388,22 @@ function refreshPlcStatus() {
             } else {
                 display.textContent = '(none)';
                 unpairBtn.disabled = true;
+            }
+
+            // Show the RFCOMM channel currently in use (discovered via SDP)
+            // or a status-appropriate placeholder.
+            const chanEl = document.getElementById('plc-effective-channel-display');
+            if (chanEl) {
+                const effective = parseInt(data.effective_channel);
+                if (data.status === 'connected' && effective > 0) {
+                    chanEl.textContent = 'Channel ' + effective;
+                } else if (effective > 0) {
+                    chanEl.textContent = 'Channel ' + effective + ' (last used)';
+                } else {
+                    chanEl.textContent = data.status === 'not_paired'
+                        ? '(pair a PLC first)'
+                        : '(not connected)';
+                }
             }
         });
     refreshPlcDiscovered();
