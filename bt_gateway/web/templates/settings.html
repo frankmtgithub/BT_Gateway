@@ -1,0 +1,362 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+    <!-- Adapter Configuration -->
+    <div class="col-12 col-lg-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-usb-drive"></i> Bluetooth Adapters</h5>
+            </div>
+            <div class="card-body">
+                <p class="text-muted mb-3">
+                    Select which adapter to use for the PLC connection and which
+                    for device connections. Each must be a different adapter.
+                </p>
+                <div class="mb-3">
+                    <label for="plc-adapter-select" class="form-label">PLC Adapter</label>
+                    <select class="form-select" id="plc-adapter-select">
+                        <option value="">-- Select adapter --</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label for="device-adapter-select" class="form-label">Device Adapter</label>
+                    <select class="form-select" id="device-adapter-select">
+                        <option value="">-- Select adapter --</option>
+                    </select>
+                </div>
+                <button class="btn btn-outline-primary" id="refresh-adapters-btn">
+                    <i class="bi bi-arrow-clockwise"></i> Refresh Adapters
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- PLC Configuration -->
+    <div class="col-12 col-lg-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-cpu"></i> PLC Connection</h5>
+            </div>
+            <div class="card-body">
+                <p class="text-muted small mb-3">
+                    The PLC's Bluetooth address is taken from the single device paired on
+                    the PLC adapter — pair it below, there is no MAC field.
+                </p>
+                <div class="mb-3">
+                    <label class="form-label">Paired PLC</label>
+                    <div class="input-group">
+                        <span class="input-group-text font-monospace" id="plc-paired-display">
+                            (none)
+                        </span>
+                        <button class="btn btn-outline-danger" id="plc-unpair-btn" disabled>
+                            <i class="bi bi-x-circle"></i> Unpair
+                        </button>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label for="plc-channel-input" class="form-label">RFCOMM Channel</label>
+                    <input type="number" class="form-control" id="plc-channel-input"
+                           value="1" min="1" max="30">
+                </div>
+                <div class="mb-3">
+                    <label for="plc-port-input" class="form-label">COM Port</label>
+                    <select class="form-select" id="plc-port-input"></select>
+                    <small class="text-muted">
+                        Port number (<code>/dev/rfcommN</code>) reserved for the PLC
+                        connection.  Released back to the OS if the PLC is unpaired.
+                    </small>
+                </div>
+                <div class="mb-3">
+                    <label for="plc-reconnect-input" class="form-label">
+                        Reconnect Interval (seconds)
+                    </label>
+                    <input type="number" class="form-control" id="plc-reconnect-input"
+                           value="5" min="1" max="300">
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- PLC Pairing -->
+    <div class="col-12">
+        <div class="card border-info">
+            <div class="card-header bg-info bg-opacity-25 d-flex justify-content-between align-items-center">
+                <h5 class="mb-0"><i class="bi bi-broadcast"></i> Pair the PLC</h5>
+                <span class="badge bg-secondary fs-6" id="plc-discovery-badge">IDLE</span>
+            </div>
+            <div class="card-body">
+                <p class="text-muted mb-3">
+                    Only one PLC may be paired per adapter.  Pairing is automatic — PIN /
+                    passkey confirmations are accepted by the gateway without user input.
+                </p>
+                <div class="d-flex gap-2 mb-3">
+                    <button class="btn btn-success" id="plc-discover-btn">
+                        <i class="bi bi-search"></i> Scan for PLC
+                    </button>
+                    <button class="btn btn-secondary" id="plc-discover-stop-btn">
+                        <i class="bi bi-stop-circle"></i> Stop Scan
+                    </button>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Address</th>
+                                <th>Paired</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="plc-discovered-tbody">
+                            <tr>
+                                <td colspan="4" class="text-muted text-center py-4">
+                                    Select a PLC adapter then press "Scan for PLC".
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Available Adapters Info -->
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-info-circle"></i> Detected Adapters</h5>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Address</th>
+                                <th>Powered</th>
+                                <th>Alias</th>
+                            </tr>
+                        </thead>
+                        <tbody id="adapters-tbody">
+                            <tr>
+                                <td colspan="4" class="text-muted text-center py-4">
+                                    Loading adapters...
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Save -->
+    <div class="col-12">
+        <div class="d-flex gap-2">
+            <button class="btn btn-primary btn-lg" id="save-settings-btn">
+                <i class="bi bi-check-lg"></i> Save Settings
+            </button>
+            <span class="align-self-center text-success d-none" id="save-success">
+                Settings saved successfully!
+            </span>
+        </div>
+        <p class="text-muted mt-2">
+            <i class="bi bi-exclamation-triangle"></i>
+            Changing adapters requires a restart of the application to take effect.
+        </p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    loadAdapters();
+    loadSettings();
+    refreshPlcStatus();
+
+    document.getElementById('refresh-adapters-btn').addEventListener('click', loadAdapters);
+    document.getElementById('save-settings-btn').addEventListener('click', saveSettings);
+    document.getElementById('plc-discover-btn').addEventListener('click', startPlcDiscovery);
+    document.getElementById('plc-discover-stop-btn').addEventListener('click', stopPlcDiscovery);
+    document.getElementById('plc-unpair-btn').addEventListener('click', unpairPlc);
+
+    setInterval(refreshPlcStatus, 5000);
+    setInterval(refreshPlcDiscovered, 5000);
+});
+
+function loadAdapters() {
+    fetch('/api/adapters')
+        .then(r => r.json())
+        .then(adapters => {
+            // Populate info table
+            const tbody = document.getElementById('adapters-tbody');
+            if (!adapters.length) {
+                tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-4">No Bluetooth adapters detected.</td></tr>';
+            } else {
+                tbody.innerHTML = adapters.map(a => `
+                    <tr>
+                        <td class="font-monospace">${escHtml(a.name)}</td>
+                        <td class="font-monospace">${escHtml(a.address)}</td>
+                        <td>${a.powered ? '<span class="badge bg-success">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td>
+                        <td>${escHtml(a.alias)}</td>
+                    </tr>
+                `).join('');
+            }
+
+            // Populate select dropdowns (preserve current selection)
+            const plcSelect = document.getElementById('plc-adapter-select');
+            const devSelect = document.getElementById('device-adapter-select');
+            const plcVal = plcSelect.value;
+            const devVal = devSelect.value;
+
+            const options = '<option value="">-- Select adapter --</option>' +
+                adapters.map(a => `<option value="${a.name}">${a.name} (${a.address})</option>`).join('');
+            plcSelect.innerHTML = options;
+            devSelect.innerHTML = options;
+
+            if (plcVal) plcSelect.value = plcVal;
+            if (devVal) devSelect.value = devVal;
+        });
+}
+
+function loadSettings() {
+    fetch('/api/settings')
+        .then(r => r.json())
+        .then(cfg => {
+            document.getElementById('plc-adapter-select').value = cfg.plc_adapter || '';
+            document.getElementById('device-adapter-select').value = cfg.device_adapter || '';
+            document.getElementById('plc-channel-input').value = cfg.plc_channel || 1;
+            document.getElementById('plc-reconnect-input').value = cfg.plc_reconnect_interval || 5;
+
+            // Fill the PLC COM port selector with available ports + the current one
+            fetch('/api/ports/available')
+                .then(r => r.json())
+                .then(data => {
+                    const ports = data.ports || [];
+                    const sel = document.getElementById('plc-port-input');
+                    const current = cfg.plc_port;
+                    let opts = ports.map(p => `<option value="${p}">/dev/rfcomm${p}</option>`);
+                    if (current != null && !ports.includes(current)) {
+                        opts.unshift(`<option value="${current}">/dev/rfcomm${current} (current)</option>`);
+                    }
+                    sel.innerHTML = opts.join('');
+                    if (current != null) sel.value = current;
+                });
+        });
+}
+
+function saveSettings() {
+    const data = {
+        plc_adapter: document.getElementById('plc-adapter-select').value,
+        device_adapter: document.getElementById('device-adapter-select').value,
+        plc_channel: parseInt(document.getElementById('plc-channel-input').value) || 1,
+        plc_port: parseInt(document.getElementById('plc-port-input').value),
+        plc_reconnect_interval: parseInt(document.getElementById('plc-reconnect-input').value) || 5,
+    };
+
+    if (data.plc_adapter && data.device_adapter && data.plc_adapter === data.device_adapter) {
+        alert('PLC and Device adapters must be different!');
+        return;
+    }
+
+    fetch('/api/settings', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(data)
+    }).then(r => r.json()).then(() => {
+        const msg = document.getElementById('save-success');
+        msg.classList.remove('d-none');
+        setTimeout(() => msg.classList.add('d-none'), 3000);
+    });
+}
+
+// ── PLC pairing flow ────────────────────────────────────────────────
+
+function refreshPlcStatus() {
+    fetch('/api/plc/status')
+        .then(r => r.json())
+        .then(data => {
+            const display = document.getElementById('plc-paired-display');
+            const unpairBtn = document.getElementById('plc-unpair-btn');
+            if (data.paired) {
+                display.textContent = data.paired.address + '  —  ' +
+                    (data.paired.name || 'Unknown');
+                unpairBtn.disabled = false;
+            } else {
+                display.textContent = '(none)';
+                unpairBtn.disabled = true;
+            }
+        });
+    refreshPlcDiscovered();
+}
+
+function startPlcDiscovery() {
+    fetch('/api/plc/discovery/start', {method: 'POST'})
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) { alert(data.error); return; }
+            document.getElementById('plc-discovery-badge').textContent = 'SCANNING';
+            document.getElementById('plc-discovery-badge').className = 'badge bg-success fs-6';
+            refreshPlcDiscovered();
+        });
+}
+
+function stopPlcDiscovery() {
+    fetch('/api/plc/discovery/stop', {method: 'POST'})
+        .then(r => r.json())
+        .then(() => {
+            document.getElementById('plc-discovery-badge').textContent = 'IDLE';
+            document.getElementById('plc-discovery-badge').className = 'badge bg-secondary fs-6';
+        });
+}
+
+function refreshPlcDiscovered() {
+    fetch('/api/plc/discovered')
+        .then(r => r.json())
+        .then(devices => {
+            const tbody = document.getElementById('plc-discovered-tbody');
+            if (!devices.length) {
+                tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-4">No devices on the PLC adapter.</td></tr>';
+                return;
+            }
+            tbody.innerHTML = devices.map(d => `
+                <tr>
+                    <td>${escHtml(d.name)}</td>
+                    <td class="font-monospace">${escHtml(d.address)}</td>
+                    <td>${d.paired ? '<span class="badge bg-success">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td>
+                    <td>
+                        ${d.paired ? '<em class="text-muted">already paired</em>' : `<button class="btn btn-sm btn-outline-success" onclick="pairPlc('${d.address}')"><i class="bi bi-link"></i> Pair as PLC</button>`}
+                    </td>
+                </tr>
+            `).join('');
+        });
+}
+
+function pairPlc(address) {
+    fetch('/api/plc/pair', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({address: address})
+    }).then(r => r.json()).then(data => {
+        if (data.error) alert('Pairing failed: ' + data.error);
+        refreshPlcStatus();
+    });
+}
+
+function unpairPlc() {
+    if (!confirm('Unpair the current PLC?')) return;
+    fetch('/api/plc/unpair', {method: 'POST'})
+        .then(r => r.json())
+        .then(() => refreshPlcStatus());
+}
+
+function escHtml(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+}
+</script>
+{% endblock %}

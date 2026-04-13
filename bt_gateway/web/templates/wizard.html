@@ -1,0 +1,542 @@
+{% extends "base.html" %}
+{% block title %}Setup Wizard{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col-12 col-xl-10 mx-auto">
+    <!-- Stepper -->
+    <ol class="list-group list-group-horizontal mb-4 shadow-sm" id="wizard-stepper">
+      <li class="list-group-item flex-fill text-center wizard-step active"
+          data-step="1">
+        <strong>1</strong> &nbsp;Adapters
+      </li>
+      <li class="list-group-item flex-fill text-center wizard-step"
+          data-step="2">
+        <strong>2</strong> &nbsp;PLC Connection
+      </li>
+      <li class="list-group-item flex-fill text-center wizard-step"
+          data-step="3">
+        <strong>3</strong> &nbsp;Devices
+      </li>
+      <li class="list-group-item flex-fill text-center wizard-step"
+          data-step="4">
+        <strong>4</strong> &nbsp;Done
+      </li>
+    </ol>
+
+    <!-- ─── Step 1: Adapters ─────────────────────────────────────────── -->
+    <div class="wizard-pane" data-pane="1">
+      <div class="card">
+        <div class="card-header">
+          <h5 class="mb-0"><i class="bi bi-usb-drive"></i> Step 1 — Select Bluetooth Adapters</h5>
+        </div>
+        <div class="card-body">
+          <p class="text-muted">
+            The gateway needs <strong>two separate adapters</strong>: one dedicated to
+            the PLC connection, and one that accepts connections from devices.  Saving
+            this step will restart the application so the new adapter bindings take effect.
+          </p>
+          <div class="mb-3">
+            <label for="wiz-plc-adapter" class="form-label">PLC Adapter</label>
+            <select class="form-select" id="wiz-plc-adapter">
+              <option value="">-- Select adapter --</option>
+            </select>
+          </div>
+          <div class="mb-3">
+            <label for="wiz-device-adapter" class="form-label">Device Adapter</label>
+            <select class="form-select" id="wiz-device-adapter">
+              <option value="">-- Select adapter --</option>
+            </select>
+          </div>
+          <button class="btn btn-outline-secondary" id="wiz-refresh-adapters">
+            <i class="bi bi-arrow-clockwise"></i> Refresh Adapter List
+          </button>
+          <div class="mt-4 pt-3 border-top d-flex justify-content-end gap-2">
+            <button class="btn btn-primary" id="wiz-save-step1">
+              <i class="bi bi-check-lg"></i> Save &amp; Continue
+            </button>
+          </div>
+          <div class="alert alert-warning d-none mt-3" id="wiz-restart-notice">
+            Adapters changed — the application will restart to apply them.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── Step 2: PLC ──────────────────────────────────────────────── -->
+    <div class="wizard-pane d-none" data-pane="2">
+      <div class="card">
+        <div class="card-header">
+          <h5 class="mb-0"><i class="bi bi-cpu"></i> Step 2 — Establish PLC Connection</h5>
+        </div>
+        <div class="card-body">
+          <p class="text-muted">
+            Pair exactly one PLC on the PLC adapter.  The MAC is taken from the paired
+            device — there is no MAC field.  PIN / passkey prompts are auto-accepted.
+          </p>
+
+          <div class="alert alert-info" id="wiz-plc-paired-box">
+            <strong>Currently paired PLC:</strong>
+            <span id="wiz-plc-paired">(none)</span>
+            <button class="btn btn-sm btn-outline-danger ms-2 d-none"
+                    id="wiz-plc-unpair">
+              <i class="bi bi-x-circle"></i> Unpair
+            </button>
+          </div>
+
+          <div class="row g-3 mb-3">
+            <div class="col-md-4">
+              <label class="form-label">RFCOMM Channel</label>
+              <input type="number" class="form-control" id="wiz-plc-channel"
+                     min="1" max="30" value="1">
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">COM Port</label>
+              <select class="form-select" id="wiz-plc-port"></select>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">Reconnect Interval (s)</label>
+              <input type="number" class="form-control" id="wiz-plc-reconnect"
+                     min="1" max="300" value="5">
+            </div>
+          </div>
+
+          <div class="d-flex gap-2 mb-3">
+            <button class="btn btn-success" id="wiz-plc-scan">
+              <i class="bi bi-search"></i> Scan for PLC
+            </button>
+            <button class="btn btn-secondary" id="wiz-plc-scan-stop">
+              <i class="bi bi-stop-circle"></i> Stop
+            </button>
+            <span class="badge bg-secondary align-self-center fs-6"
+                  id="wiz-plc-scan-badge">IDLE</span>
+          </div>
+          <div class="table-responsive">
+            <table class="table table-sm table-hover mb-0">
+              <thead>
+                <tr><th>Name</th><th>Address</th><th>Paired</th><th></th></tr>
+              </thead>
+              <tbody id="wiz-plc-discovered">
+                <tr><td colspan="4" class="text-muted text-center py-3">Press "Scan for PLC" to start.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="mt-4 pt-3 border-top d-flex justify-content-between gap-2">
+            <button class="btn btn-outline-secondary" data-back>
+              <i class="bi bi-chevron-left"></i> Back
+            </button>
+            <button class="btn btn-primary" id="wiz-save-step2">
+              <i class="bi bi-check-lg"></i> Save &amp; Continue
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── Step 3: Devices ──────────────────────────────────────────── -->
+    <div class="wizard-pane d-none" data-pane="3">
+      <div class="card">
+        <div class="card-header">
+          <h5 class="mb-0"><i class="bi bi-phone"></i> Step 3 — Pair Devices</h5>
+        </div>
+        <div class="card-body">
+          <p class="text-muted">
+            Enable pairing mode, then pair each device.  Each gets a connection name
+            and a COM port automatically — you can change either later.
+          </p>
+
+          <div class="d-flex gap-2 mb-3">
+            <button class="btn btn-success" id="wiz-dev-enable">
+              <i class="bi bi-broadcast"></i> Enable Pairing
+            </button>
+            <button class="btn btn-secondary" id="wiz-dev-disable">
+              <i class="bi bi-stop-circle"></i> Disable Pairing
+            </button>
+            <span class="badge bg-secondary align-self-center fs-6"
+                  id="wiz-dev-badge">OFF</span>
+          </div>
+
+          <h6 class="mt-4">Discovered devices</h6>
+          <div class="table-responsive">
+            <table class="table table-sm table-hover mb-0">
+              <thead>
+                <tr><th>Name</th><th>Address</th><th>Paired</th><th></th></tr>
+              </thead>
+              <tbody id="wiz-dev-discovered">
+                <tr><td colspan="4" class="text-muted text-center py-3">Enable pairing to discover devices.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h6 class="mt-4">Paired devices</h6>
+          <div class="table-responsive">
+            <table class="table table-sm table-hover mb-0">
+              <thead>
+                <tr><th>Name</th><th>Address</th><th>COM Port</th></tr>
+              </thead>
+              <tbody id="wiz-dev-paired">
+                <tr><td colspan="3" class="text-muted text-center py-3">No paired devices yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="mt-4 pt-3 border-top d-flex justify-content-between gap-2">
+            <button class="btn btn-outline-secondary" data-back>
+              <i class="bi bi-chevron-left"></i> Back
+            </button>
+            <button class="btn btn-primary" id="wiz-save-step3">
+              <i class="bi bi-check-lg"></i> Finish
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── Step 4: Done ─────────────────────────────────────────────── -->
+    <div class="wizard-pane d-none" data-pane="4">
+      <div class="card border-success">
+        <div class="card-body text-center py-5">
+          <i class="bi bi-check-circle-fill text-success" style="font-size:3rem;"></i>
+          <h4 class="mt-3">Setup complete!</h4>
+          <p class="text-muted">
+            The gateway is configured.  You can re-run this wizard at any time to
+            change the settings — they will override whatever is currently saved.
+          </p>
+          <a href="/" class="btn btn-primary me-2">
+            <i class="bi bi-speedometer2"></i> Go to Dashboard
+          </a>
+          <button class="btn btn-outline-secondary" data-restart-wiz>
+            <i class="bi bi-arrow-clockwise"></i> Run Wizard Again
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div id="wiz-restart-overlay" class="d-none text-center mt-4">
+      <div class="spinner-border text-primary"></div>
+      <p class="mt-2">Restarting gateway… this page will reload in a few seconds.</p>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<style>
+  .wizard-step { background:#161b22; color:#8b949e; }
+  .wizard-step.active { background:#1f6feb; color:#fff; font-weight:bold; }
+  .wizard-step.done { background:#238636; color:#fff; }
+</style>
+<script>
+let originalAdapters = { plc: '', device: '' };
+
+document.addEventListener('DOMContentLoaded', function() {
+  // Step navigation
+  document.querySelectorAll('[data-back]').forEach(btn => {
+    btn.addEventListener('click', () => goStep(currentStep() - 1));
+  });
+  document.querySelectorAll('[data-restart-wiz]').forEach(btn => {
+    btn.addEventListener('click', () => goStep(1));
+  });
+
+  // Step 1
+  document.getElementById('wiz-refresh-adapters').addEventListener('click', loadAdapters);
+  document.getElementById('wiz-save-step1').addEventListener('click', saveStep1);
+
+  // Step 2
+  document.getElementById('wiz-plc-scan').addEventListener('click', startPlcScan);
+  document.getElementById('wiz-plc-scan-stop').addEventListener('click', stopPlcScan);
+  document.getElementById('wiz-plc-unpair').addEventListener('click', unpairPlc);
+  document.getElementById('wiz-save-step2').addEventListener('click', saveStep2);
+
+  // Step 3
+  document.getElementById('wiz-dev-enable').addEventListener('click', enableDevPairing);
+  document.getElementById('wiz-dev-disable').addEventListener('click', disableDevPairing);
+  document.getElementById('wiz-save-step3').addEventListener('click', saveStep3);
+
+  loadAdapters();
+  loadCurrentSettings();
+
+  // Background refresh for steps 2 & 3 while the user is on them
+  setInterval(() => {
+    if (currentStep() === 2) { refreshPlcStatus(); refreshPlcDiscovered(); }
+    if (currentStep() === 3) { refreshDevDiscovered(); refreshDevPaired(); }
+  }, 4000);
+});
+
+function currentStep() {
+  const active = document.querySelector('.wizard-pane:not(.d-none)');
+  return active ? parseInt(active.dataset.pane) : 1;
+}
+
+function goStep(n) {
+  if (n < 1 || n > 4) return;
+  document.querySelectorAll('.wizard-pane').forEach(p => p.classList.add('d-none'));
+  document.querySelector('.wizard-pane[data-pane="' + n + '"]').classList.remove('d-none');
+  document.querySelectorAll('.wizard-step').forEach(s => {
+    const step = parseInt(s.dataset.step);
+    s.classList.remove('active', 'done');
+    if (step < n) s.classList.add('done');
+    else if (step === n) s.classList.add('active');
+  });
+  if (n === 2) { refreshPlcStatus(); refreshPlcDiscovered(); loadPlcSettings(); }
+  if (n === 3) { refreshDevDiscovered(); refreshDevPaired(); }
+}
+
+function loadCurrentSettings() {
+  fetch('/api/settings').then(r => r.json()).then(cfg => {
+    originalAdapters.plc = cfg.plc_adapter || '';
+    originalAdapters.device = cfg.device_adapter || '';
+    document.getElementById('wiz-plc-adapter').value = cfg.plc_adapter || '';
+    document.getElementById('wiz-device-adapter').value = cfg.device_adapter || '';
+    document.getElementById('wiz-plc-channel').value = cfg.plc_channel || 1;
+    document.getElementById('wiz-plc-reconnect').value = cfg.plc_reconnect_interval || 5;
+  });
+}
+
+function loadAdapters() {
+  fetch('/api/adapters').then(r => r.json()).then(adapters => {
+    const opts = '<option value="">-- Select adapter --</option>' +
+      adapters.map(a => `<option value="${a.name}">${a.name} (${a.address})</option>`).join('');
+    ['wiz-plc-adapter', 'wiz-device-adapter'].forEach(id => {
+      const sel = document.getElementById(id);
+      const cur = sel.value;
+      sel.innerHTML = opts;
+      if (cur) sel.value = cur;
+    });
+    loadCurrentSettings();
+  });
+}
+
+// ── Step 1 save ─────────────────────────────────────────────────────
+
+function saveStep1() {
+  const plcAdp = document.getElementById('wiz-plc-adapter').value;
+  const devAdp = document.getElementById('wiz-device-adapter').value;
+  if (!plcAdp || !devAdp) { alert('Please select both adapters.'); return; }
+  if (plcAdp === devAdp) { alert('PLC and Device adapters must be different.'); return; }
+
+  const adaptersChanged = (plcAdp !== originalAdapters.plc) ||
+                          (devAdp !== originalAdapters.device);
+
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ plc_adapter: plcAdp, device_adapter: devAdp })
+  }).then(r => r.json()).then(() => {
+    if (adaptersChanged) {
+      document.getElementById('wiz-restart-notice').classList.remove('d-none');
+      restartAndGo(2);
+    } else {
+      goStep(2);
+    }
+  });
+}
+
+// ── Step 2: PLC ─────────────────────────────────────────────────────
+
+function loadPlcSettings() {
+  fetch('/api/settings').then(r => r.json()).then(cfg => {
+    document.getElementById('wiz-plc-channel').value = cfg.plc_channel || 1;
+    document.getElementById('wiz-plc-reconnect').value = cfg.plc_reconnect_interval || 5;
+    fetch('/api/ports/available').then(r => r.json()).then(d => {
+      const ports = d.ports || [];
+      const sel = document.getElementById('wiz-plc-port');
+      const cur = cfg.plc_port;
+      let opts = ports.map(p => `<option value="${p}">/dev/rfcomm${p}</option>`);
+      if (cur != null && !ports.includes(cur)) {
+        opts.unshift(`<option value="${cur}">/dev/rfcomm${cur} (current)</option>`);
+      }
+      sel.innerHTML = opts.join('');
+      if (cur != null) sel.value = cur;
+    });
+  });
+}
+
+function refreshPlcStatus() {
+  fetch('/api/plc/status').then(r => r.json()).then(data => {
+    const disp = document.getElementById('wiz-plc-paired');
+    const btn = document.getElementById('wiz-plc-unpair');
+    if (data.paired) {
+      disp.textContent = data.paired.address +
+        (data.paired.name ? ' (' + data.paired.name + ')' : '');
+      btn.classList.remove('d-none');
+    } else {
+      disp.textContent = '(none)';
+      btn.classList.add('d-none');
+    }
+  });
+}
+
+function startPlcScan() {
+  fetch('/api/plc/discovery/start', {method: 'POST'}).then(r => r.json()).then(d => {
+    if (d.error) { alert(d.error); return; }
+    const b = document.getElementById('wiz-plc-scan-badge');
+    b.textContent = 'SCANNING'; b.className = 'badge bg-success fs-6 align-self-center';
+    refreshPlcDiscovered();
+  });
+}
+
+function stopPlcScan() {
+  fetch('/api/plc/discovery/stop', {method: 'POST'}).then(() => {
+    const b = document.getElementById('wiz-plc-scan-badge');
+    b.textContent = 'IDLE'; b.className = 'badge bg-secondary fs-6 align-self-center';
+  });
+}
+
+function refreshPlcDiscovered() {
+  fetch('/api/plc/discovered').then(r => r.json()).then(devices => {
+    const tbody = document.getElementById('wiz-plc-discovered');
+    if (!devices.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-3">No devices found yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = devices.map(d => `
+      <tr>
+        <td>${escHtml(d.name)}</td>
+        <td class="font-monospace">${escHtml(d.address)}</td>
+        <td>${d.paired ? '<span class="badge bg-success">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td>
+        <td>${d.paired ? '' : `<button class="btn btn-sm btn-outline-success" onclick="pairPlc('${d.address}')">Pair as PLC</button>`}</td>
+      </tr>
+    `).join('');
+  });
+}
+
+function pairPlc(address) {
+  fetch('/api/plc/pair', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({address: address})
+  }).then(r => r.json()).then(d => {
+    if (d.error) alert('Pairing failed: ' + d.error);
+    refreshPlcStatus();
+  });
+}
+
+function unpairPlc() {
+  if (!confirm('Unpair current PLC?')) return;
+  fetch('/api/plc/unpair', {method: 'POST'}).then(() => refreshPlcStatus());
+}
+
+function saveStep2() {
+  const data = {
+    plc_channel: parseInt(document.getElementById('wiz-plc-channel').value) || 1,
+    plc_port: parseInt(document.getElementById('wiz-plc-port').value),
+    plc_reconnect_interval: parseInt(document.getElementById('wiz-plc-reconnect').value) || 5,
+  };
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(data)
+  }).then(() => goStep(3));
+}
+
+// ── Step 3: Devices ────────────────────────────────────────────────
+
+function enableDevPairing() {
+  fetch('/api/pairing/enable', {method: 'POST'}).then(r => r.json()).then(d => {
+    if (d.error) { alert(d.error); return; }
+    const b = document.getElementById('wiz-dev-badge');
+    b.textContent = 'ON'; b.className = 'badge bg-success fs-6 align-self-center';
+    refreshDevDiscovered();
+  });
+}
+
+function disableDevPairing() {
+  fetch('/api/pairing/disable', {method: 'POST'}).then(() => {
+    const b = document.getElementById('wiz-dev-badge');
+    b.textContent = 'OFF'; b.className = 'badge bg-secondary fs-6 align-self-center';
+  });
+}
+
+function refreshDevDiscovered() {
+  fetch('/api/pairing/devices').then(r => r.json()).then(devices => {
+    const tbody = document.getElementById('wiz-dev-discovered');
+    if (!devices.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-3">No devices found yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = devices.map(d => `
+      <tr>
+        <td>${escHtml(d.name)}</td>
+        <td class="font-monospace">${escHtml(d.address)}</td>
+        <td>${d.paired ? '<span class="badge bg-success">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td>
+        <td>${d.paired ? '' : `<button class="btn btn-sm btn-outline-success" onclick="pairDev('${d.address}')">Pair</button>`}</td>
+      </tr>
+    `).join('');
+  });
+}
+
+function pairDev(address) {
+  fetch('/api/pairing/pair', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({address: address})
+  }).then(r => r.json()).then(d => {
+    if (d.error) alert('Pairing failed: ' + d.error);
+    refreshDevDiscovered();
+    refreshDevPaired();
+  });
+}
+
+function refreshDevPaired() {
+  fetch('/api/status').then(r => r.json()).then(data => {
+    const tbody = document.getElementById('wiz-dev-paired');
+    const devices = data.devices || {};
+    const entries = Object.entries(devices);
+    if (!entries.length) {
+      tbody.innerHTML = '<tr><td colspan="3" class="text-muted text-center py-3">No paired devices yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = entries.map(([addr, info]) => `
+      <tr>
+        <td>${escHtml(info.name)}</td>
+        <td class="font-monospace">${escHtml(addr)}</td>
+        <td class="font-monospace">${info.port != null ? '/dev/rfcomm' + info.port : '(none)'}</td>
+      </tr>
+    `).join('');
+  });
+}
+
+function saveStep3() {
+  // Turn off pairing mode as courtesy, then finish
+  fetch('/api/pairing/disable', {method: 'POST'}).finally(() => goStep(4));
+}
+
+// ── Restart helpers ─────────────────────────────────────────────────
+
+function restartAndGo(targetStep) {
+  document.getElementById('wiz-restart-overlay').classList.remove('d-none');
+  fetch('/api/restart', {method: 'POST'}).then(() => {
+    // Poll /api/status until the server comes back, then reload into the
+    // requested step.  We remember the step via localStorage.
+    localStorage.setItem('wizardResumeStep', String(targetStep));
+    const started = Date.now();
+    const poll = setInterval(() => {
+      fetch('/api/status').then(r => {
+        if (r.ok) {
+          clearInterval(poll);
+          location.reload();
+        }
+      }).catch(() => {});
+      if (Date.now() - started > 60000) clearInterval(poll);
+    }, 1500);
+  });
+}
+
+// Resume into the requested step after a restart-triggered reload
+(function resumeAfterRestart() {
+  const step = localStorage.getItem('wizardResumeStep');
+  if (step) {
+    localStorage.removeItem('wizardResumeStep');
+    setTimeout(() => goStep(parseInt(step)), 200);
+  }
+})();
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s == null ? '' : String(s);
+  return d.innerHTML;
+}
+</script>
+{% endblock %}

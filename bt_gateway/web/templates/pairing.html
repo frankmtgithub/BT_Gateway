@@ -1,0 +1,350 @@
+{% extends "base.html" %}
+{% block title %}Pairing{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+    <!-- Pairing Controls -->
+    <div class="col-12">
+        <div class="card border-warning">
+            <div class="card-header bg-warning bg-opacity-25 d-flex justify-content-between align-items-center">
+                <h5 class="mb-0"><i class="bi bi-broadcast"></i> Device Pairing Mode</h5>
+                <span class="badge bg-secondary fs-6" id="pairing-status-badge">OFF</span>
+            </div>
+            <div class="card-body">
+                <p class="text-muted mb-3">
+                    When pairing mode is enabled, the gateway becomes discoverable and
+                    accepts pairing requests from nearby Bluetooth devices.  PIN / passkey
+                    confirmations are handled automatically &mdash; no user interaction needed.
+                </p>
+                <div class="d-flex gap-2">
+                    <button class="btn btn-success" id="enable-pairing-btn">
+                        <i class="bi bi-broadcast"></i> Enable Pairing
+                    </button>
+                    <button class="btn btn-secondary" id="disable-pairing-btn">
+                        <i class="bi bi-stop-circle"></i> Disable Pairing
+                    </button>
+                    <button class="btn btn-outline-primary ms-auto" id="refresh-devices-btn">
+                        <i class="bi bi-arrow-clockwise"></i> Refresh
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Discovered Devices -->
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-search"></i> Discovered Devices</h5>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Address</th>
+                                <th>Paired</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="discovered-tbody">
+                            <tr>
+                                <td colspan="4" class="text-muted text-center py-4">
+                                    Enable pairing mode and wait for devices to appear.
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Paired Devices Management -->
+    <div class="col-12">
+        <div class="card border-danger">
+            <div class="card-header bg-danger bg-opacity-25 d-flex justify-content-between align-items-center">
+                <h5 class="mb-0"><i class="bi bi-link-45deg"></i> Paired Devices</h5>
+                <button class="btn btn-sm btn-outline-danger" id="remove-all-btn">
+                    <i class="bi bi-trash"></i> Remove All
+                </button>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0">
+                        <thead>
+                            <tr>
+                                <th>Connection Name</th>
+                                <th>Address</th>
+                                <th>COM Port</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="paired-tbody">
+                            <tr>
+                                <td colspan="4" class="text-muted text-center py-4">
+                                    No paired devices.
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                <small class="text-muted d-block mt-2">
+                    <i class="bi bi-info-circle"></i>
+                    Each connection is married to a COM port (<code>/dev/rfcommN</code>)
+                    when paired.  Removing the connection releases the port back to the OS.
+                </small>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Rename Modal -->
+<div class="modal fade" id="renameModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Rename Device</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="rename-address">
+                <div class="mb-3">
+                    <label for="rename-input" class="form-label">Connection Name</label>
+                    <input type="text" class="form-control" id="rename-input"
+                           placeholder="e.g. connection1">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" id="rename-save-btn">Save</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- COM Port Modal -->
+<div class="modal fade" id="portModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Change COM Port</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="port-address">
+                <p class="text-muted small">
+                    Pick an unused COM port for this connection. The current port is
+                    included in the list.
+                </p>
+                <div class="mb-3">
+                    <label for="port-select" class="form-label">COM Port</label>
+                    <select class="form-select" id="port-select"></select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" id="port-save-btn">Save</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const enableBtn = document.getElementById('enable-pairing-btn');
+    const disableBtn = document.getElementById('disable-pairing-btn');
+    const refreshBtn = document.getElementById('refresh-devices-btn');
+    const removeAllBtn = document.getElementById('remove-all-btn');
+    const renameSaveBtn = document.getElementById('rename-save-btn');
+    const portSaveBtn = document.getElementById('port-save-btn');
+
+    enableBtn.addEventListener('click', function() {
+        fetch('/api/pairing/enable', {method: 'POST'})
+            .then(r => r.json())
+            .then(() => {
+                document.getElementById('pairing-status-badge').textContent = 'ON';
+                document.getElementById('pairing-status-badge').className = 'badge bg-success fs-6';
+                refreshDiscovered();
+            });
+    });
+
+    disableBtn.addEventListener('click', function() {
+        fetch('/api/pairing/disable', {method: 'POST'})
+            .then(r => r.json())
+            .then(() => {
+                document.getElementById('pairing-status-badge').textContent = 'OFF';
+                document.getElementById('pairing-status-badge').className = 'badge bg-secondary fs-6';
+            });
+    });
+
+    refreshBtn.addEventListener('click', refreshDiscovered);
+    removeAllBtn.addEventListener('click', function() {
+        if (confirm('Remove ALL paired devices? This will disconnect all active connections.')) {
+            fetch('/api/pairing/remove-all', {method: 'POST'})
+                .then(r => r.json())
+                .then(() => { refreshDiscovered(); refreshPaired(); });
+        }
+    });
+
+    renameSaveBtn.addEventListener('click', function() {
+        const addr = document.getElementById('rename-address').value;
+        const name = document.getElementById('rename-input').value.trim();
+        if (!name) return;
+        const urlAddr = addr.replace(/:/g, '-');
+        fetch('/api/devices/' + urlAddr + '/rename', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: name})
+        }).then(r => r.json()).then(() => {
+            bootstrap.Modal.getInstance(document.getElementById('renameModal')).hide();
+            refreshPaired();
+        });
+    });
+
+    portSaveBtn.addEventListener('click', function() {
+        const addr = document.getElementById('port-address').value;
+        const port = parseInt(document.getElementById('port-select').value);
+        if (isNaN(port)) return;
+        const urlAddr = addr.replace(/:/g, '-');
+        fetch('/api/devices/' + urlAddr + '/port', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({port: port})
+        }).then(r => r.json()).then(data => {
+            if (data.error) { alert(data.error); return; }
+            bootstrap.Modal.getInstance(document.getElementById('portModal')).hide();
+            refreshPaired();
+        });
+    });
+
+    // Check current pairing mode
+    fetch('/api/pairing/mode').then(r => r.json()).then(data => {
+        const badge = document.getElementById('pairing-status-badge');
+        if (data.enabled) {
+            badge.textContent = 'ON';
+            badge.className = 'badge bg-success fs-6';
+        }
+    });
+
+    refreshDiscovered();
+    refreshPaired();
+    setInterval(refreshDiscovered, 5000);
+    setInterval(refreshPaired, 10000);
+});
+
+function refreshDiscovered() {
+    fetch('/api/pairing/devices')
+        .then(r => r.json())
+        .then(devices => {
+            const tbody = document.getElementById('discovered-tbody');
+            if (!devices.length) {
+                tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-4">No devices discovered yet.</td></tr>';
+                return;
+            }
+            tbody.innerHTML = devices.map(d => `
+                <tr>
+                    <td>${escHtml(d.name)}</td>
+                    <td class="font-monospace">${escHtml(d.address)}</td>
+                    <td>${d.paired ? '<span class="badge bg-success">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td>
+                    <td>
+                        ${d.paired ? '' : `<button class="btn btn-sm btn-outline-success" onclick="pairDevice('${d.address}')"><i class="bi bi-link"></i> Pair</button>`}
+                    </td>
+                </tr>
+            `).join('');
+        });
+}
+
+function refreshPaired() {
+    fetch('/api/status')
+        .then(r => r.json())
+        .then(data => {
+            const tbody = document.getElementById('paired-tbody');
+            const devices = data.devices || {};
+            const entries = Object.entries(devices);
+            if (!entries.length) {
+                tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-4">No paired devices.</td></tr>';
+                return;
+            }
+            tbody.innerHTML = entries.map(([addr, info]) => `
+                <tr>
+                    <td>${escHtml(info.name)}</td>
+                    <td class="font-monospace">${escHtml(addr)}</td>
+                    <td class="font-monospace">${info.port != null ? '/dev/rfcomm' + info.port : '<span class="text-muted">(none)</span>'}</td>
+                    <td>
+                        <button class="btn btn-sm btn-outline-primary me-1"
+                                onclick="openRename('${addr}', '${escHtml(info.name)}')"
+                                title="Rename">
+                            <i class="bi bi-pencil"></i>
+                        </button>
+                        <button class="btn btn-sm btn-outline-secondary me-1"
+                                onclick="openPort('${addr}', ${info.port != null ? info.port : 'null'})"
+                                title="Change COM port">
+                            <i class="bi bi-hdd-network"></i>
+                        </button>
+                        <button class="btn btn-sm btn-outline-danger"
+                                onclick="removeDevice('${addr}')"
+                                title="Remove">
+                            <i class="bi bi-trash"></i>
+                        </button>
+                    </td>
+                </tr>
+            `).join('');
+        });
+}
+
+function pairDevice(address) {
+    fetch('/api/pairing/pair', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({address: address})
+    }).then(r => r.json()).then(data => {
+        if (data.error) alert('Pairing failed: ' + data.error);
+        else { refreshDiscovered(); refreshPaired(); }
+    });
+}
+
+function removeDevice(address) {
+    if (!confirm('Remove device ' + address + '? The COM port assigned to this connection will be released back to the OS.')) return;
+    fetch('/api/pairing/remove', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({address: address})
+    }).then(r => r.json()).then(() => { refreshDiscovered(); refreshPaired(); });
+}
+
+function openRename(address, currentName) {
+    document.getElementById('rename-address').value = address;
+    document.getElementById('rename-input').value = currentName;
+    new bootstrap.Modal(document.getElementById('renameModal')).show();
+}
+
+function openPort(address, currentPort) {
+    document.getElementById('port-address').value = address;
+    const urlAddr = address.replace(/:/g, '-');
+    fetch('/api/ports/available?for=' + urlAddr)
+        .then(r => r.json())
+        .then(data => {
+            const sel = document.getElementById('port-select');
+            const ports = data.ports || [];
+            let options = ports.map(p => `<option value="${p}">/dev/rfcomm${p}</option>`);
+            // Include the current port so the user sees what's selected
+            if (currentPort != null && !ports.includes(currentPort)) {
+                options.unshift(`<option value="${currentPort}">/dev/rfcomm${currentPort} (current)</option>`);
+            }
+            sel.innerHTML = options.join('');
+            if (currentPort != null) sel.value = currentPort;
+            new bootstrap.Modal(document.getElementById('portModal')).show();
+        });
+}
+
+function escHtml(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+}
+</script>
+{% endblock %}
