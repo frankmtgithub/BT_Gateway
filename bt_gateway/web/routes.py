@@ -52,6 +52,34 @@ def api_adapters():
     return jsonify(adapters)
 
 
+@bp.route("/api/adapters/<adapter_name>/power", methods=["POST"])
+def api_adapter_power(adapter_name):
+    """Power an adapter on or off.
+
+    Body: {"powered": true/false}
+    """
+    data = request.get_json(silent=True) or {}
+    powered = bool(data.get("powered", True))
+    success = current_app.bt_manager.power_adapter(adapter_name, powered)
+    if not success:
+        return jsonify({"error": f"Failed to power {adapter_name}"}), 500
+    return jsonify({
+        "status": "ok",
+        "adapter": adapter_name,
+        "powered": powered,
+    })
+
+
+def _resolve_pairing_adapter(data=None):
+    """Get the adapter to use for pairing, preferring the request payload
+    but falling back to the configured device adapter."""
+    if data:
+        adapter = (data.get("adapter") or "").strip()
+        if adapter:
+            return adapter
+    return current_app.gateway_config.get("device_adapter", "")
+
+
 # ── Pairing API (device adapter) ─────────────────────────────────────────────
 
 @bp.route("/api/pairing/mode", methods=["GET"])
@@ -61,29 +89,35 @@ def api_pairing_mode_get():
 
 @bp.route("/api/pairing/enable", methods=["POST"])
 def api_pairing_enable():
-    adapter_name = current_app.gateway_config.get("device_adapter", "")
+    data = request.get_json(silent=True) or {}
+    adapter_name = _resolve_pairing_adapter(data)
     if not adapter_name:
-        return jsonify({"error": "No device adapter configured"}), 400
+        return jsonify({"error": "No adapter selected"}), 400
 
-    # Start discovery and make discoverable
-    current_app.device_server.set_pairing_mode(True)
+    # Make sure the adapter is powered before discovery
+    current_app.bt_manager.power_adapter(adapter_name, True)
+
+    # Make discoverable/pairable on the chosen adapter and start discovery
+    current_app.device_server.set_pairing_mode(True, adapter_name=adapter_name)
     current_app.bt_manager.start_discovery(adapter_name)
-    return jsonify({"status": "pairing_enabled"})
+    return jsonify({"status": "pairing_enabled", "adapter": adapter_name})
 
 
 @bp.route("/api/pairing/disable", methods=["POST"])
 def api_pairing_disable():
-    adapter_name = current_app.gateway_config.get("device_adapter", "")
+    data = request.get_json(silent=True) or {}
+    adapter_name = _resolve_pairing_adapter(data)
     if adapter_name:
         current_app.bt_manager.stop_discovery(adapter_name)
-    current_app.device_server.set_pairing_mode(False)
-    return jsonify({"status": "pairing_disabled"})
+    current_app.device_server.set_pairing_mode(False, adapter_name=adapter_name)
+    return jsonify({"status": "pairing_disabled", "adapter": adapter_name})
 
 
 @bp.route("/api/pairing/devices")
 def api_pairing_devices():
-    """List discovered and paired devices on the device adapter."""
-    adapter_name = current_app.gateway_config.get("device_adapter", "")
+    """List discovered and paired devices on the requested adapter."""
+    adapter_name = (request.args.get("adapter") or "").strip() \
+        or current_app.gateway_config.get("device_adapter", "")
     if not adapter_name:
         return jsonify([])
     devices = current_app.bt_manager.list_devices(adapter_name)
@@ -92,12 +126,12 @@ def api_pairing_devices():
 
 @bp.route("/api/pairing/pair", methods=["POST"])
 def api_pair_device():
-    data = request.get_json()
+    data = request.get_json() or {}
     address = data.get("address", "")
     if not address:
         return jsonify({"error": "No address provided"}), 400
 
-    adapter_name = current_app.gateway_config.get("device_adapter", "")
+    adapter_name = _resolve_pairing_adapter(data)
     success = current_app.bt_manager.pair_device(address, adapter_name)
     if success:
         # Force SPP, kill HID so barcode scanners don't act as keyboards
@@ -106,18 +140,21 @@ def api_pair_device():
         entry = current_app.gateway_config.add_device(address)
         name = entry["name"] if isinstance(entry, dict) else entry
         port = entry["port"] if isinstance(entry, dict) else None
-        return jsonify({"status": "paired", "name": name, "port": port})
+        return jsonify({
+            "status": "paired", "name": name, "port": port,
+            "adapter": adapter_name,
+        })
     return jsonify({"error": "Pairing failed"}), 500
 
 
 @bp.route("/api/pairing/remove", methods=["POST"])
 def api_remove_device():
-    data = request.get_json()
+    data = request.get_json() or {}
     address = data.get("address", "")
     if not address:
         return jsonify({"error": "No address provided"}), 400
 
-    adapter_name = current_app.gateway_config.get("device_adapter", "")
+    adapter_name = _resolve_pairing_adapter(data)
 
     # Disconnect if active
     profile = current_app.device_server.profile
@@ -134,7 +171,8 @@ def api_remove_device():
 @bp.route("/api/pairing/remove-all", methods=["POST"])
 def api_remove_all():
     """Disconnect and unpair all devices."""
-    adapter_name = current_app.gateway_config.get("device_adapter", "")
+    data = request.get_json(silent=True) or {}
+    adapter_name = _resolve_pairing_adapter(data)
     profile = current_app.device_server.profile
 
     # Disconnect all active connections

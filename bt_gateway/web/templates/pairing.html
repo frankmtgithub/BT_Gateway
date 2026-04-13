@@ -16,16 +16,28 @@
                     accepts pairing requests from nearby Bluetooth devices.  PIN / passkey
                     confirmations are handled automatically &mdash; no user interaction needed.
                 </p>
-                <div class="d-flex gap-2">
-                    <button class="btn btn-success" id="enable-pairing-btn">
-                        <i class="bi bi-broadcast"></i> Enable Pairing
-                    </button>
-                    <button class="btn btn-secondary" id="disable-pairing-btn">
-                        <i class="bi bi-stop-circle"></i> Disable Pairing
-                    </button>
-                    <button class="btn btn-outline-primary ms-auto" id="refresh-devices-btn">
-                        <i class="bi bi-arrow-clockwise"></i> Refresh
-                    </button>
+                <div class="row g-2 align-items-end">
+                    <div class="col-12 col-md-5">
+                        <label for="pairing-adapter-select" class="form-label mb-1">
+                            Pair using adapter
+                        </label>
+                        <select class="form-select" id="pairing-adapter-select">
+                            <option value="">-- Loading adapters --</option>
+                        </select>
+                    </div>
+                    <div class="col-12 col-md-7">
+                        <div class="d-flex gap-2 flex-wrap">
+                            <button class="btn btn-success" id="enable-pairing-btn">
+                                <i class="bi bi-broadcast"></i> Enable Pairing
+                            </button>
+                            <button class="btn btn-secondary" id="disable-pairing-btn">
+                                <i class="bi bi-stop-circle"></i> Disable Pairing
+                            </button>
+                            <button class="btn btn-outline-primary ms-auto" id="refresh-devices-btn">
+                                <i class="bi bi-arrow-clockwise"></i> Refresh
+                            </button>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -161,11 +173,25 @@ document.addEventListener('DOMContentLoaded', function() {
     const removeAllBtn = document.getElementById('remove-all-btn');
     const renameSaveBtn = document.getElementById('rename-save-btn');
     const portSaveBtn = document.getElementById('port-save-btn');
+    const adapterSelect = document.getElementById('pairing-adapter-select');
+
+    // Refresh device list whenever the adapter selection changes
+    adapterSelect.addEventListener('change', refreshDiscovered);
 
     enableBtn.addEventListener('click', function() {
-        fetch('/api/pairing/enable', {method: 'POST'})
+        const adapter = currentPairingAdapter();
+        if (!adapter) {
+            alert('Select a Bluetooth adapter to use for pairing.');
+            return;
+        }
+        fetch('/api/pairing/enable', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({adapter: adapter}),
+        })
             .then(r => r.json())
-            .then(() => {
+            .then(data => {
+                if (data.error) { alert(data.error); return; }
                 document.getElementById('pairing-status-badge').textContent = 'ON';
                 document.getElementById('pairing-status-badge').className = 'badge bg-success fs-6';
                 refreshDiscovered();
@@ -173,7 +199,12 @@ document.addEventListener('DOMContentLoaded', function() {
     });
 
     disableBtn.addEventListener('click', function() {
-        fetch('/api/pairing/disable', {method: 'POST'})
+        const adapter = currentPairingAdapter();
+        fetch('/api/pairing/disable', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({adapter: adapter}),
+        })
             .then(r => r.json())
             .then(() => {
                 document.getElementById('pairing-status-badge').textContent = 'OFF';
@@ -184,7 +215,12 @@ document.addEventListener('DOMContentLoaded', function() {
     refreshBtn.addEventListener('click', refreshDiscovered);
     removeAllBtn.addEventListener('click', function() {
         if (confirm('Remove ALL paired devices? This will disconnect all active connections.')) {
-            fetch('/api/pairing/remove-all', {method: 'POST'})
+            const adapter = currentPairingAdapter();
+            fetch('/api/pairing/remove-all', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({adapter: adapter}),
+            })
                 .then(r => r.json())
                 .then(() => { refreshDiscovered(); refreshPaired(); });
         }
@@ -230,14 +266,49 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     });
 
-    refreshDiscovered();
-    refreshPaired();
+    // Load adapters + saved settings, then run the first refresh
+    loadPairingAdapters().then(() => {
+        refreshDiscovered();
+        refreshPaired();
+    });
     setInterval(refreshDiscovered, 5000);
     setInterval(refreshPaired, 10000);
 });
 
+function currentPairingAdapter() {
+    const sel = document.getElementById('pairing-adapter-select');
+    return sel ? sel.value : '';
+}
+
+function loadPairingAdapters() {
+    // Fetch the saved settings and the available adapters in parallel,
+    // then default the dropdown to the configured device adapter.
+    return Promise.all([
+        fetch('/api/adapters').then(r => r.json()),
+        fetch('/api/settings').then(r => r.json()).catch(() => ({})),
+    ]).then(([adapters, cfg]) => {
+        const sel = document.getElementById('pairing-adapter-select');
+        const previous = sel.value;
+        if (!adapters.length) {
+            sel.innerHTML = '<option value="">-- No adapters detected --</option>';
+            return;
+        }
+        sel.innerHTML = '<option value="">-- Select adapter --</option>' +
+            adapters.map(a => `<option value="${escAttr(a.name)}">${escHtml(a.name)} (${escHtml(a.address)})</option>`).join('');
+
+        const target = previous
+            || (cfg && cfg.device_adapter)
+            || adapters[0].name;
+        if (target) sel.value = target;
+    });
+}
+
 function refreshDiscovered() {
-    fetch('/api/pairing/devices')
+    const adapter = currentPairingAdapter();
+    const url = adapter
+        ? '/api/pairing/devices?adapter=' + encodeURIComponent(adapter)
+        : '/api/pairing/devices';
+    fetch(url)
         .then(r => r.json())
         .then(devices => {
             const tbody = document.getElementById('discovered-tbody');
@@ -251,7 +322,7 @@ function refreshDiscovered() {
                     <td class="font-monospace">${escHtml(d.address)}</td>
                     <td>${d.paired ? '<span class="badge bg-success">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td>
                     <td>
-                        ${d.paired ? '' : `<button class="btn btn-sm btn-outline-success" onclick="pairDevice('${d.address}')"><i class="bi bi-link"></i> Pair</button>`}
+                        ${d.paired ? '' : `<button class="btn btn-sm btn-outline-success" onclick="pairDevice('${escAttr(d.address)}')"><i class="bi bi-link"></i> Pair</button>`}
                     </td>
                 </tr>
             `).join('');
@@ -300,7 +371,7 @@ function pairDevice(address) {
     fetch('/api/pairing/pair', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({address: address})
+        body: JSON.stringify({address: address, adapter: currentPairingAdapter()})
     }).then(r => r.json()).then(data => {
         if (data.error) alert('Pairing failed: ' + data.error);
         else { refreshDiscovered(); refreshPaired(); }
@@ -312,7 +383,7 @@ function removeDevice(address) {
     fetch('/api/pairing/remove', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({address: address})
+        body: JSON.stringify({address: address, adapter: currentPairingAdapter()})
     }).then(r => r.json()).then(() => { refreshDiscovered(); refreshPaired(); });
 }
 
@@ -345,6 +416,10 @@ function escHtml(s) {
     const d = document.createElement('div');
     d.textContent = s;
     return d.innerHTML;
+}
+
+function escAttr(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/'/g, '&#39;').replace(/"/g, '&quot;');
 }
 </script>
 {% endblock %}

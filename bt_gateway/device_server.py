@@ -299,17 +299,29 @@ class DeviceServer:
             self._profile.disconnect_all()
         self.set_pairing_mode(False)
 
-    def set_pairing_mode(self, enabled):
-        """Enable or disable pairing mode (discoverable + pairable)."""
-        adapter_name = self._config.get("device_adapter", "")
+    def set_pairing_mode(self, enabled, adapter_name=None):
+        """Enable or disable pairing mode (discoverable + pairable).
+
+        ``adapter_name`` overrides the configured device adapter when provided.
+        """
+        if not adapter_name:
+            adapter_name = self._config.get("device_adapter", "")
         if not adapter_name:
             return False
         self._bt_manager.set_discoverable(adapter_name, enabled)
         self._bt_manager.set_pairable(adapter_name, enabled)
         self._pairing_mode = enabled
-        logger.info("Pairing mode %s on %s", "enabled" if enabled else "disabled", adapter_name)
+        logger.info(
+            "Pairing mode %s on %s",
+            "enabled" if enabled else "disabled",
+            adapter_name,
+        )
         if self._socketio:
-            self._socketio.emit("pairing_mode", {"enabled": enabled}, namespace="/")
+            self._socketio.emit(
+                "pairing_mode",
+                {"enabled": enabled, "adapter": adapter_name},
+                namespace="/",
+            )
         return True
 
     @property
