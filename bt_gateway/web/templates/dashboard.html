@@ -7,22 +7,26 @@
     <div class="col-12">
         <div class="card border-info" id="plc-card">
             <div class="card-header bg-info bg-opacity-25 d-flex justify-content-between align-items-center">
-                <h5 class="mb-0"><i class="bi bi-cpu"></i> PLC Connection</h5>
+                <h5 class="mb-0"><i class="bi bi-cpu"></i> PLC Connection (SPP)</h5>
                 <span class="badge bg-secondary fs-6" id="plc-status-badge">--</span>
             </div>
             <div class="card-body">
                 <div class="row">
-                    <div class="col-md-4">
+                    <div class="col-md-3">
                         <strong>Status:</strong>
                         <span id="plc-status-text" class="ms-2">--</span>
                     </div>
-                    <div class="col-md-4">
+                    <div class="col-md-3">
                         <strong>Address:</strong>
                         <span id="plc-address" class="ms-2 font-monospace">--</span>
                     </div>
-                    <div class="col-md-4">
+                    <div class="col-md-3">
                         <strong>Adapter:</strong>
                         <span id="plc-adapter" class="ms-2 font-monospace">--</span>
+                    </div>
+                    <div class="col-md-3">
+                        <strong>COM Port:</strong>
+                        <span id="plc-port" class="ms-2 font-monospace">--</span>
                     </div>
                 </div>
             </div>
@@ -44,11 +48,12 @@
                                 <th>Status</th>
                                 <th>Name</th>
                                 <th>Address</th>
+                                <th>COM Port</th>
                             </tr>
                         </thead>
                         <tbody id="devices-tbody">
                             <tr>
-                                <td colspan="3" class="text-muted text-center py-4">
+                                <td colspan="4" class="text-muted text-center py-4">
                                     No devices configured. Go to
                                     <a href="/pairing">Pairing</a> to add devices.
                                 </td>
@@ -63,13 +68,25 @@
     <!-- Message Log -->
     <div class="col-12">
         <div class="card">
-            <div class="card-header d-flex justify-content-between align-items-center">
+            <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
                 <h5 class="mb-0"><i class="bi bi-journal-text"></i> Message Log</h5>
-                <button class="btn btn-sm btn-outline-secondary" id="clear-log-btn">Clear</button>
+                <div class="d-flex align-items-center gap-2">
+                    <div class="form-check form-switch me-2 mb-0">
+                        <input class="form-check-input" type="checkbox" id="debug-mode-switch">
+                        <label class="form-check-label" for="debug-mode-switch">
+                            Debug mode (log all raw chunks per connection)
+                        </label>
+                    </div>
+                    <select class="form-select form-select-sm" id="log-filter"
+                            style="width:auto;">
+                        <option value="">All connections</option>
+                    </select>
+                    <button class="btn btn-sm btn-outline-secondary" id="clear-log-btn">Clear</button>
+                </div>
             </div>
             <div class="card-body p-0">
                 <div id="message-log" class="font-monospace small p-3"
-                     style="max-height:300px;overflow-y:auto;background:#1a1a2e;">
+                     style="max-height:400px;overflow-y:auto;background:#1a1a2e;">
                     <div class="text-muted">Waiting for messages...</div>
                 </div>
             </div>
@@ -88,8 +105,21 @@ document.addEventListener('DOMContentLoaded', function() {
     setInterval(fetchStatus, 5000);
 
     document.getElementById('clear-log-btn').addEventListener('click', function() {
-        document.getElementById('message-log').innerHTML =
-            '<div class="text-muted">Log cleared.</div>';
+        const log = document.getElementById('message-log');
+        log.innerHTML = '<div class="text-muted">Log cleared.</div>';
+    });
+
+    // Debug-mode switch
+    const dbgSwitch = document.getElementById('debug-mode-switch');
+    fetch('/api/debug_mode').then(r => r.json()).then(d => {
+        dbgSwitch.checked = !!d.enabled;
+    });
+    dbgSwitch.addEventListener('change', function() {
+        fetch('/api/debug_mode', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled: dbgSwitch.checked})
+        });
     });
 });
 </script>

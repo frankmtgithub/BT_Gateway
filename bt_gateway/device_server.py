@@ -4,6 +4,11 @@ Registers an SPP (Serial Port Profile) service on the device adapter.
 When a remote device connects, BlueZ hands us the RFCOMM file descriptor
 through the Profile1.NewConnection callback.  A reader thread is spawned
 for each connected device to forward data to the message router.
+
+Because some devices (e.g. barcode scanners) also expose HID and will
+default to Bluetooth keyboard input that opens URLs in the user's
+browser, we actively disconnect the HID profile on connect so the data
+flows only through SPP to our router.
 """
 
 import logging
@@ -23,6 +28,7 @@ except ImportError:
     BTPROTO_RFCOMM = 3
 
 SPP_UUID = "00001101-0000-1000-8000-00805f9b34fb"
+HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
 PROFILE_PATH = "/org/bluez/btgateway/spp_profile"
 RECV_BUFFER = 4096
 
@@ -30,11 +36,12 @@ RECV_BUFFER = 4096
 class DeviceConnection:
     """Wraps a single RFCOMM connection to a remote device."""
 
-    def __init__(self, address, sock, on_data, on_disconnect):
+    def __init__(self, address, sock, on_data, on_disconnect, on_raw=None):
         self.address = address
         self._sock = sock
         self._on_data = on_data
         self._on_disconnect = on_disconnect
+        self._on_raw = on_raw
         self._running = False
         self._thread = None
         self._send_lock = threading.Lock()
@@ -76,6 +83,12 @@ class DeviceConnection:
                     logger.info("Device %s disconnected (EOF)", self.address)
                     break
                 decoded = data.decode("utf-8", errors="replace")
+                # Debug / raw chunk notification
+                if self._on_raw is not None:
+                    try:
+                        self._on_raw(self.address, decoded)
+                    except Exception:
+                        logger.exception("on_raw callback failed")
                 buffer += decoded
                 # Process complete lines (newline-delimited)
                 while "\n" in buffer:
@@ -139,7 +152,16 @@ class SPPProfile(dbus.service.Object):
             return
 
         # Register device in config if not already present
-        device_name = self._config.add_device(address)
+        device_entry = self._config.add_device(address)
+        device_name = device_entry["name"] if isinstance(device_entry, dict) \
+            else device_entry
+
+        # HID scanners announce both SPP and HID.  BlueZ will usually bring
+        # up both, meaning scan events are sent to the OS as keystrokes
+        # (which is why scanning opens a browser URL).  Disconnect HID so
+        # the data stays on our SPP channel only.
+        adapter_name = self._config.get("device_adapter", "")
+        self._bt_manager.disconnect_profile(address, HID_UUID, adapter_name)
 
         # Create and start the device connection handler
         conn = DeviceConnection(
@@ -147,6 +169,7 @@ class SPPProfile(dbus.service.Object):
             sock=sock,
             on_data=self._on_device_data,
             on_disconnect=self._on_device_disconnect,
+            on_raw=self._on_device_raw,
         )
 
         with self._lock:
@@ -186,6 +209,10 @@ class SPPProfile(dbus.service.Object):
     def _on_device_data(self, address, data):
         """Called by a DeviceConnection reader thread when data arrives."""
         self._router.route_from_device(address, data)
+
+    def _on_device_raw(self, address, raw_chunk):
+        """Debug notification of a raw chunk from a device."""
+        self._router.notify_device_raw(address, raw_chunk)
 
     def _on_device_disconnect(self, address):
         """Called when a device connection drops."""

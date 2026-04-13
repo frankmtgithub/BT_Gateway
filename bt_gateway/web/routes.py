@@ -1,12 +1,18 @@
 """Web routes and API endpoints for BT Gateway."""
 
 import logging
+import os
+import sys
+import threading
 
 from flask import Blueprint, current_app, jsonify, render_template, request
 
 logger = logging.getLogger(__name__)
 
 bp = Blueprint("gateway", __name__)
+
+SPP_UUID = "00001101-0000-1000-8000-00805f9b34fb"
+HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
 
 
 # ── Page routes ──────────────────────────────────────────────────────────────
@@ -26,6 +32,11 @@ def settings():
     return render_template("settings.html")
 
 
+@bp.route("/wizard")
+def wizard():
+    return render_template("wizard.html")
+
+
 # ── Status API ───────────────────────────────────────────────────────────────
 
 @bp.route("/api/status")
@@ -41,7 +52,7 @@ def api_adapters():
     return jsonify(adapters)
 
 
-# ── Pairing API ──────────────────────────────────────────────────────────────
+# ── Pairing API (device adapter) ─────────────────────────────────────────────
 
 @bp.route("/api/pairing/mode", methods=["GET"])
 def api_pairing_mode_get():
@@ -89,8 +100,13 @@ def api_pair_device():
     adapter_name = current_app.gateway_config.get("device_adapter", "")
     success = current_app.bt_manager.pair_device(address, adapter_name)
     if success:
-        name = current_app.gateway_config.add_device(address)
-        return jsonify({"status": "paired", "name": name})
+        # Force SPP, kill HID so barcode scanners don't act as keyboards
+        current_app.bt_manager.disconnect_profile(address, HID_UUID, adapter_name)
+        current_app.bt_manager.connect_profile(address, SPP_UUID, adapter_name)
+        entry = current_app.gateway_config.add_device(address)
+        name = entry["name"] if isinstance(entry, dict) else entry
+        port = entry["port"] if isinstance(entry, dict) else None
+        return jsonify({"status": "paired", "name": name, "port": port})
     return jsonify({"error": "Pairing failed"}), 500
 
 
@@ -110,7 +126,7 @@ def api_remove_device():
 
     # Remove from BlueZ
     current_app.bt_manager.remove_device(address, adapter_name)
-    # Remove from config
+    # Remove from config (also releases port)
     current_app.gateway_config.remove_device(address)
     return jsonify({"status": "removed"})
 
@@ -135,6 +151,103 @@ def api_remove_all():
     return jsonify({"status": "all_removed"})
 
 
+# ── PLC pairing API (PLC adapter, single device only) ───────────────────────
+
+@bp.route("/api/plc/status")
+def api_plc_status():
+    """Return information about the PLC's paired device (if any)."""
+    adapter = current_app.gateway_config.get("plc_adapter", "")
+    paired = None
+    if adapter:
+        paired = current_app.bt_manager.get_single_paired_device(adapter)
+    plc_conn = current_app.plc_connection
+    return jsonify({
+        "adapter": adapter,
+        "paired": paired,
+        "status": plc_conn.status if plc_conn else "disconnected",
+        "channel": current_app.gateway_config.get("plc_channel", 1),
+        "port": current_app.gateway_config.get("plc_port", 0),
+    })
+
+
+@bp.route("/api/plc/discovery/start", methods=["POST"])
+def api_plc_discovery_start():
+    adapter = current_app.gateway_config.get("plc_adapter", "")
+    if not adapter:
+        return jsonify({"error": "No PLC adapter configured"}), 400
+    # Only allow one paired PLC
+    if current_app.bt_manager.get_single_paired_device(adapter):
+        return jsonify({
+            "error": "A PLC is already paired on this adapter. "
+                     "Unpair it first to scan for a different one."
+        }), 400
+    current_app.bt_manager.power_adapter(adapter, True)
+    current_app.bt_manager.start_discovery(adapter)
+    return jsonify({"status": "discovering"})
+
+
+@bp.route("/api/plc/discovery/stop", methods=["POST"])
+def api_plc_discovery_stop():
+    adapter = current_app.gateway_config.get("plc_adapter", "")
+    if adapter:
+        current_app.bt_manager.stop_discovery(adapter)
+    return jsonify({"status": "stopped"})
+
+
+@bp.route("/api/plc/discovered")
+def api_plc_discovered():
+    adapter = current_app.gateway_config.get("plc_adapter", "")
+    if not adapter:
+        return jsonify([])
+    return jsonify(current_app.bt_manager.list_devices(adapter))
+
+
+@bp.route("/api/plc/pair", methods=["POST"])
+def api_plc_pair():
+    """Pair the single PLC on the PLC adapter."""
+    data = request.get_json() or {}
+    address = (data.get("address") or "").strip()
+    if not address:
+        return jsonify({"error": "No address provided"}), 400
+
+    adapter = current_app.gateway_config.get("plc_adapter", "")
+    if not adapter:
+        return jsonify({"error": "No PLC adapter configured"}), 400
+
+    existing = current_app.bt_manager.get_single_paired_device(adapter)
+    if existing and existing["address"].upper() != address.upper():
+        return jsonify({
+            "error": f"A PLC ({existing['address']}) is already paired. "
+                     "Unpair it first."
+        }), 400
+
+    if not current_app.bt_manager.pair_device(address, adapter):
+        return jsonify({"error": "Pairing failed"}), 500
+
+    # Force SPP — kill any audio/HID that BlueZ may have connected
+    for uuid in (HID_UUID,
+                 "0000110b-0000-1000-8000-00805f9b34fb",
+                 "0000110a-0000-1000-8000-00805f9b34fb",
+                 "0000111e-0000-1000-8000-00805f9b34fb",
+                 "00001108-0000-1000-8000-00805f9b34fb"):
+        current_app.bt_manager.disconnect_profile(address, uuid, adapter)
+    current_app.bt_manager.connect_profile(address, SPP_UUID, adapter)
+    current_app.bt_manager.stop_discovery(adapter)
+    return jsonify({"status": "paired", "address": address.upper()})
+
+
+@bp.route("/api/plc/unpair", methods=["POST"])
+def api_plc_unpair():
+    adapter = current_app.gateway_config.get("plc_adapter", "")
+    if not adapter:
+        return jsonify({"error": "No PLC adapter configured"}), 400
+    paired = current_app.bt_manager.get_single_paired_device(adapter)
+    if not paired:
+        return jsonify({"status": "no_plc_paired"})
+    current_app.bt_manager.remove_device(paired["address"], adapter)
+    return jsonify({"status": "unpaired", "address": paired["address"]})
+
+
 # ── Settings API ─────────────────────────────────────────────────────────────
 
 @bp.route("/api/settings", methods=["GET"])
@@ -143,10 +256,11 @@ def api_settings_get():
     return jsonify({
         "plc_adapter": cfg.get("plc_adapter", ""),
         "device_adapter": cfg.get("device_adapter", ""),
-        "plc_address": cfg.get("plc_address", ""),
         "plc_channel": cfg.get("plc_channel", 1),
+        "plc_port": cfg.get("plc_port", 0),
         "plc_reconnect_interval": cfg.get("plc_reconnect_interval", 5),
         "web_port": cfg.get("web_port", 8080),
+        "debug_mode": bool(cfg.get("debug_mode", False)),
     })
 
 
@@ -156,19 +270,62 @@ def api_settings_update():
     cfg = current_app.gateway_config
 
     allowed = [
-        "plc_adapter", "device_adapter", "plc_address",
-        "plc_channel", "plc_reconnect_interval",
+        "plc_adapter", "device_adapter",
+        "plc_channel", "plc_port", "plc_reconnect_interval",
     ]
     for key in allowed:
         if key in data:
             value = data[key]
-            if key == "plc_channel":
-                value = int(value)
-            elif key == "plc_reconnect_interval":
-                value = int(value)
+            if key in ("plc_channel", "plc_port", "plc_reconnect_interval"):
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    continue
             cfg.set(key, value)
 
     return jsonify({"status": "saved"})
+
+
+# ── Debug mode API ──────────────────────────────────────────────────────────
+
+@bp.route("/api/debug_mode", methods=["GET"])
+def api_debug_mode_get():
+    return jsonify({"enabled": bool(current_app.gateway_config.get("debug_mode", False))})
+
+
+@bp.route("/api/debug_mode", methods=["POST"])
+def api_debug_mode_set():
+    data = request.get_json() or {}
+    enabled = bool(data.get("enabled", False))
+    current_app.gateway_config.set("debug_mode", enabled)
+    return jsonify({"enabled": enabled})
+
+
+# ── COM port API ────────────────────────────────────────────────────────────
+
+@bp.route("/api/ports/available")
+def api_ports_available():
+    address = request.args.get("for", "")
+    if address:
+        address = address.replace("-", ":").upper()
+    ports = current_app.gateway_config.available_ports(
+        exclude_address=address or None
+    )
+    return jsonify({"ports": ports})
+
+
+@bp.route("/api/devices/<address>/port", methods=["POST"])
+def api_set_device_port(address):
+    address = address.replace("-", ":").upper()
+    data = request.get_json() or {}
+    try:
+        port = int(data.get("port"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid port"}), 400
+    ok = current_app.gateway_config.set_device_port(address, port)
+    if not ok:
+        return jsonify({"error": "Port unavailable or device unknown"}), 400
+    return jsonify({"status": "set", "port": port})
 
 
 # ── Device renaming API ─────────────────────────────────────────────────────
@@ -186,3 +343,36 @@ def api_rename_device(address):
     if success:
         return jsonify({"status": "renamed", "name": new_name})
     return jsonify({"error": "Device not found"}), 404
+
+
+# ── Restart (for wizard adapter re-selection) ───────────────────────────────
+
+def _restart_process():
+    """Re-exec the current Python process.
+
+    Invoked from a short-lived background thread so the HTTP response has
+    time to reach the client before the process image is replaced.
+    """
+    logger.info("Restarting process via os.execv")
+    try:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        logger.error("os.execv failed, exiting so supervisor can restart: %s", e)
+        os._exit(0)
+
+
+@bp.route("/api/restart", methods=["POST"])
+def api_restart():
+    """Relaunch the gateway process.
+
+    Used by the setup wizard after changing adapters or other settings
+    that need a full restart to take effect.  The response is sent first;
+    the restart happens 0.5s later on a background thread.
+    """
+    def _go():
+        import time as _t
+        _t.sleep(0.5)
+        _restart_process()
+
+    threading.Thread(target=_go, daemon=True, name="restart").start()
+    return jsonify({"status": "restarting"})

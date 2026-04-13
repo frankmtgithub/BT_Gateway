@@ -1,10 +1,11 @@
 {
   "plc_adapter": "",
   "device_adapter": "",
-  "plc_address": "",
   "plc_channel": 1,
+  "plc_port": 0,
   "plc_reconnect_interval": 5,
   "web_host": "0.0.0.0",
   "web_port": 8080,
+  "debug_mode": false,
   "devices": {}
 }

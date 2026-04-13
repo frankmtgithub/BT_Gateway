@@ -7,13 +7,14 @@
     <div class="col-12">
         <div class="card border-warning">
             <div class="card-header bg-warning bg-opacity-25 d-flex justify-content-between align-items-center">
-                <h5 class="mb-0"><i class="bi bi-broadcast"></i> Pairing Mode</h5>
+                <h5 class="mb-0"><i class="bi bi-broadcast"></i> Device Pairing Mode</h5>
                 <span class="badge bg-secondary fs-6" id="pairing-status-badge">OFF</span>
             </div>
             <div class="card-body">
                 <p class="text-muted mb-3">
                     When pairing mode is enabled, the gateway becomes discoverable and
-                    accepts pairing requests from nearby Bluetooth devices.
+                    accepts pairing requests from nearby Bluetooth devices.  PIN / passkey
+                    confirmations are handled automatically &mdash; no user interaction needed.
                 </p>
                 <div class="d-flex gap-2">
                     <button class="btn btn-success" id="enable-pairing-btn">
@@ -76,18 +77,24 @@
                             <tr>
                                 <th>Connection Name</th>
                                 <th>Address</th>
+                                <th>COM Port</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
                         <tbody id="paired-tbody">
                             <tr>
-                                <td colspan="3" class="text-muted text-center py-4">
+                                <td colspan="4" class="text-muted text-center py-4">
                                     No paired devices.
                                 </td>
                             </tr>
                         </tbody>
                     </table>
                 </div>
+                <small class="text-muted d-block mt-2">
+                    <i class="bi bi-info-circle"></i>
+                    Each connection is married to a COM port (<code>/dev/rfcommN</code>)
+                    when paired.  Removing the connection releases the port back to the OS.
+                </small>
             </div>
         </div>
     </div>
@@ -116,6 +123,33 @@
         </div>
     </div>
 </div>
+
+<!-- COM Port Modal -->
+<div class="modal fade" id="portModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Change COM Port</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="port-address">
+                <p class="text-muted small">
+                    Pick an unused COM port for this connection. The current port is
+                    included in the list.
+                </p>
+                <div class="mb-3">
+                    <label for="port-select" class="form-label">COM Port</label>
+                    <select class="form-select" id="port-select"></select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" id="port-save-btn">Save</button>
+            </div>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -126,6 +160,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const refreshBtn = document.getElementById('refresh-devices-btn');
     const removeAllBtn = document.getElementById('remove-all-btn');
     const renameSaveBtn = document.getElementById('rename-save-btn');
+    const portSaveBtn = document.getElementById('port-save-btn');
 
     enableBtn.addEventListener('click', function() {
         fetch('/api/pairing/enable', {method: 'POST'})
@@ -166,6 +201,22 @@ document.addEventListener('DOMContentLoaded', function() {
             body: JSON.stringify({name: name})
         }).then(r => r.json()).then(() => {
             bootstrap.Modal.getInstance(document.getElementById('renameModal')).hide();
+            refreshPaired();
+        });
+    });
+
+    portSaveBtn.addEventListener('click', function() {
+        const addr = document.getElementById('port-address').value;
+        const port = parseInt(document.getElementById('port-select').value);
+        if (isNaN(port)) return;
+        const urlAddr = addr.replace(/:/g, '-');
+        fetch('/api/devices/' + urlAddr + '/port', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({port: port})
+        }).then(r => r.json()).then(data => {
+            if (data.error) { alert(data.error); return; }
+            bootstrap.Modal.getInstance(document.getElementById('portModal')).hide();
             refreshPaired();
         });
     });
@@ -215,20 +266,28 @@ function refreshPaired() {
             const devices = data.devices || {};
             const entries = Object.entries(devices);
             if (!entries.length) {
-                tbody.innerHTML = '<tr><td colspan="3" class="text-muted text-center py-4">No paired devices.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-4">No paired devices.</td></tr>';
                 return;
             }
             tbody.innerHTML = entries.map(([addr, info]) => `
                 <tr>
                     <td>${escHtml(info.name)}</td>
                     <td class="font-monospace">${escHtml(addr)}</td>
+                    <td class="font-monospace">${info.port != null ? '/dev/rfcomm' + info.port : '<span class="text-muted">(none)</span>'}</td>
                     <td>
                         <button class="btn btn-sm btn-outline-primary me-1"
-                                onclick="openRename('${addr}', '${escHtml(info.name)}')">
+                                onclick="openRename('${addr}', '${escHtml(info.name)}')"
+                                title="Rename">
                             <i class="bi bi-pencil"></i>
                         </button>
+                        <button class="btn btn-sm btn-outline-secondary me-1"
+                                onclick="openPort('${addr}', ${info.port != null ? info.port : 'null'})"
+                                title="Change COM port">
+                            <i class="bi bi-hdd-network"></i>
+                        </button>
                         <button class="btn btn-sm btn-outline-danger"
-                                onclick="removeDevice('${addr}')">
+                                onclick="removeDevice('${addr}')"
+                                title="Remove">
                             <i class="bi bi-trash"></i>
                         </button>
                     </td>
@@ -249,7 +308,7 @@ function pairDevice(address) {
 }
 
 function removeDevice(address) {
-    if (!confirm('Remove device ' + address + '?')) return;
+    if (!confirm('Remove device ' + address + '? The COM port assigned to this connection will be released back to the OS.')) return;
     fetch('/api/pairing/remove', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -261,6 +320,25 @@ function openRename(address, currentName) {
     document.getElementById('rename-address').value = address;
     document.getElementById('rename-input').value = currentName;
     new bootstrap.Modal(document.getElementById('renameModal')).show();
+}
+
+function openPort(address, currentPort) {
+    document.getElementById('port-address').value = address;
+    const urlAddr = address.replace(/:/g, '-');
+    fetch('/api/ports/available?for=' + urlAddr)
+        .then(r => r.json())
+        .then(data => {
+            const sel = document.getElementById('port-select');
+            const ports = data.ports || [];
+            let options = ports.map(p => `<option value="${p}">/dev/rfcomm${p}</option>`);
+            // Include the current port so the user sees what's selected
+            if (currentPort != null && !ports.includes(currentPort)) {
+                options.unshift(`<option value="${currentPort}">/dev/rfcomm${currentPort} (current)</option>`);
+            }
+            sel.innerHTML = options.join('');
+            if (currentPort != null) sel.value = currentPort;
+            new bootstrap.Modal(document.getElementById('portModal')).show();
+        });
 }
 
 function escHtml(s) {

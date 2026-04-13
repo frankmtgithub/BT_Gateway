@@ -196,6 +196,90 @@ class BluetoothManager:
             logger.error("Failed to pair with %s: %s", device_address, e)
             return False
 
+    def connect_profile(self, device_address, uuid, adapter_name=None):
+        """Ask BlueZ to connect a specific profile UUID on the given device.
+
+        This marks the connection as belonging to that profile (e.g. SPP)
+        instead of whatever BlueZ decides from the device's advertised
+        services (which may default to audio/HID when the remote announces
+        multiple profiles).
+        """
+        device_path = self._find_device_path(device_address, adapter_name)
+        if not device_path:
+            logger.error("Device %s not found for ConnectProfile", device_address)
+            return False
+        try:
+            device = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, device_path), DEVICE_IFACE
+            )
+            device.ConnectProfile(uuid)
+            logger.info("ConnectProfile(%s) on %s", uuid, device_address)
+            return True
+        except dbus.DBusException as e:
+            logger.warning("ConnectProfile(%s) on %s failed: %s",
+                           uuid, device_address, e)
+            return False
+
+    def disconnect_profile(self, device_address, uuid, adapter_name=None):
+        """Disconnect a specific profile on a device (e.g. HID) without
+        touching other connected profiles."""
+        device_path = self._find_device_path(device_address, adapter_name)
+        if not device_path:
+            return False
+        try:
+            device = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, device_path), DEVICE_IFACE
+            )
+            device.DisconnectProfile(uuid)
+            logger.info("DisconnectProfile(%s) on %s", uuid, device_address)
+            return True
+        except dbus.DBusException as e:
+            logger.warning("DisconnectProfile(%s) on %s failed: %s",
+                           uuid, device_address, e)
+            return False
+
+    def set_device_trusted(self, device_address, trusted=True, adapter_name=None):
+        device_path = self._find_device_path(device_address, adapter_name)
+        if not device_path:
+            return False
+        try:
+            props = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, device_path), PROPS_IFACE
+            )
+            props.Set(DEVICE_IFACE, "Trusted", dbus.Boolean(trusted))
+            return True
+        except dbus.DBusException as e:
+            logger.warning("Failed to set Trusted on %s: %s", device_address, e)
+            return False
+
+    def get_device_uuids(self, device_address, adapter_name=None):
+        """Return the list of service UUIDs advertised by a paired device."""
+        device_path = self._find_device_path(device_address, adapter_name)
+        if not device_path:
+            return []
+        try:
+            props = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, device_path), PROPS_IFACE
+            )
+            uuids = props.Get(DEVICE_IFACE, "UUIDs")
+            return [str(u).lower() for u in uuids]
+        except dbus.DBusException as e:
+            logger.warning("Failed to read UUIDs on %s: %s", device_address, e)
+            return []
+
+    def list_paired_devices(self, adapter_name):
+        """Return the paired devices on the given adapter."""
+        return [d for d in self.list_devices(adapter_name) if d["paired"]]
+
+    def get_single_paired_device(self, adapter_name):
+        """Return the single paired device on an adapter, or None.
+
+        Used by the PLC side where only one paired device is supported per
+        adapter.  If multiple are present, the first is returned.
+        """
+        paired = self.list_paired_devices(adapter_name)
+        return paired[0] if paired else None
+
     def remove_device(self, device_address, adapter_name=None):
         """Remove (unpair) a device."""
         device_path = self._find_device_path(device_address, adapter_name)
