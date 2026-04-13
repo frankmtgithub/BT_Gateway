@@ -76,11 +76,12 @@
                                 <th>Address</th>
                                 <th>Powered</th>
                                 <th>Alias</th>
+                                <th class="text-end">Power</th>
                             </tr>
                         </thead>
                         <tbody id="adapters-tbody">
                             <tr>
-                                <td colspan="4" class="text-muted text-center py-4">
+                                <td colspan="5" class="text-muted text-center py-4">
                                     Loading adapters...
                                 </td>
                             </tr>
@@ -112,59 +113,114 @@
 
 {% block scripts %}
 <script>
+// Cache of the most recent settings so adapter refresh keeps the saved
+// PLC / Device selection highlighted in the dropdowns.
+let savedSettings = {};
+
 document.addEventListener('DOMContentLoaded', function() {
-    loadAdapters();
-    loadSettings();
+    // Load settings first, then adapters — the adapter loader uses the saved
+    // values to pre-select the PLC and Device dropdowns reliably.
+    loadSettings().then(loadAdapters);
 
     document.getElementById('refresh-adapters-btn').addEventListener('click', loadAdapters);
     document.getElementById('save-settings-btn').addEventListener('click', saveSettings);
 });
 
 function loadAdapters() {
-    fetch('/api/adapters')
+    return fetch('/api/adapters')
         .then(r => r.json())
         .then(adapters => {
-            // Populate info table
+            // Populate info table with a power on/off action per adapter
             const tbody = document.getElementById('adapters-tbody');
             if (!adapters.length) {
-                tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-4">No Bluetooth adapters detected.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="5" class="text-muted text-center py-4">No Bluetooth adapters detected.</td></tr>';
             } else {
-                tbody.innerHTML = adapters.map(a => `
-                    <tr>
-                        <td class="font-monospace">${escHtml(a.name)}</td>
-                        <td class="font-monospace">${escHtml(a.address)}</td>
-                        <td>${a.powered ? '<span class="badge bg-success">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td>
-                        <td>${escHtml(a.alias)}</td>
-                    </tr>
-                `).join('');
+                tbody.innerHTML = adapters.map(a => {
+                    const poweredBadge = a.powered
+                        ? '<span class="badge bg-success">Yes</span>'
+                        : '<span class="badge bg-secondary">No</span>';
+                    const action = a.powered
+                        ? `<button class="btn btn-sm btn-outline-warning" onclick="setAdapterPower('${escAttr(a.name)}', false)">
+                               <i class="bi bi-power"></i> Power Off
+                           </button>`
+                        : `<button class="btn btn-sm btn-outline-success" onclick="setAdapterPower('${escAttr(a.name)}', true)">
+                               <i class="bi bi-power"></i> Power On
+                           </button>`;
+                    return `
+                        <tr>
+                            <td class="font-monospace">${escHtml(a.name)}</td>
+                            <td class="font-monospace">${escHtml(a.address)}</td>
+                            <td>${poweredBadge}</td>
+                            <td>${escHtml(a.alias)}</td>
+                            <td class="text-end">${action}</td>
+                        </tr>
+                    `;
+                }).join('');
             }
 
-            // Populate select dropdowns (preserve current selection)
+            // Populate select dropdowns. Pre-select the currently saved
+            // adapter for both the PLC and the Device when available, falling
+            // back to whatever the user had picked before refreshing.
             const plcSelect = document.getElementById('plc-adapter-select');
             const devSelect = document.getElementById('device-adapter-select');
-            const plcVal = plcSelect.value;
-            const devVal = devSelect.value;
+            const previousPlc = plcSelect.value;
+            const previousDev = devSelect.value;
 
             const options = '<option value="">-- Select adapter --</option>' +
-                adapters.map(a => `<option value="${a.name}">${a.name} (${a.address})</option>`).join('');
+                adapters.map(a => `<option value="${escAttr(a.name)}">${escHtml(a.name)} (${escHtml(a.address)})</option>`).join('');
             plcSelect.innerHTML = options;
             devSelect.innerHTML = options;
 
-            if (plcVal) plcSelect.value = plcVal;
-            if (devVal) devSelect.value = devVal;
+            const plcTarget = (savedSettings.plc_adapter || previousPlc || '');
+            const devTarget = (savedSettings.device_adapter || previousDev || '');
+
+            if (plcTarget && hasOption(plcSelect, plcTarget)) {
+                plcSelect.value = plcTarget;
+            }
+            if (devTarget && hasOption(devSelect, devTarget)) {
+                devSelect.value = devTarget;
+            }
         });
 }
 
 function loadSettings() {
-    fetch('/api/settings')
+    return fetch('/api/settings')
         .then(r => r.json())
         .then(cfg => {
-            document.getElementById('plc-adapter-select').value = cfg.plc_adapter || '';
-            document.getElementById('device-adapter-select').value = cfg.device_adapter || '';
+            savedSettings = cfg || {};
             document.getElementById('plc-address-input').value = cfg.plc_address || '';
             document.getElementById('plc-channel-input').value = cfg.plc_channel || 1;
             document.getElementById('plc-reconnect-input').value = cfg.plc_reconnect_interval || 5;
+            // The adapter dropdowns may not yet be populated (loadAdapters
+            // runs after this). loadAdapters reads savedSettings to make the
+            // pre-selection stick once the options exist.
         });
+}
+
+function setAdapterPower(name, powered) {
+    fetch('/api/adapters/' + encodeURIComponent(name) + '/power', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({powered: powered}),
+    }).then(r => r.json()).then(data => {
+        if (data.error) {
+            alert('Power change failed: ' + data.error);
+        }
+        loadAdapters();
+    }).catch(err => {
+        alert('Power change failed: ' + err);
+    });
+}
+
+function hasOption(selectEl, value) {
+    for (const opt of selectEl.options) {
+        if (opt.value === value) return true;
+    }
+    return false;
+}
+
+function escAttr(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/'/g, '&#39;').replace(/"/g, '&quot;');
 }
 
 function saveSettings() {
@@ -186,6 +242,9 @@ function saveSettings() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(data)
     }).then(r => r.json()).then(() => {
+        // Refresh the cached settings so subsequent adapter refreshes keep
+        // the PLC / Device selections highlighted.
+        savedSettings = Object.assign({}, savedSettings, data);
         const msg = document.getElementById('save-success');
         msg.classList.remove('d-none');
         setTimeout(() => msg.classList.add('d-none'), 3000);
