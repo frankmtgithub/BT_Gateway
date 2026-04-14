@@ -87,15 +87,17 @@
                     <table class="table table-hover mb-0">
                         <thead>
                             <tr>
+                                <th>Enabled</th>
                                 <th>Connection Name</th>
                                 <th>Address</th>
-                                <th>COM Port</th>
+                                <th>Listen Channel</th>
+                                <th>Pi COM Port</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
                         <tbody id="paired-tbody">
                             <tr>
-                                <td colspan="4" class="text-muted text-center py-4">
+                                <td colspan="6" class="text-muted text-center py-4">
                                     No paired devices.
                                 </td>
                             </tr>
@@ -104,8 +106,11 @@
                 </div>
                 <small class="text-muted d-block mt-2">
                     <i class="bi bi-info-circle"></i>
-                    Each connection is married to a COM port (<code>/dev/rfcommN</code>)
-                    when paired.  Removing the connection releases the port back to the OS.
+                    <strong>Listen Channel</strong> is the RFCOMM channel the
+                    gateway advertises SPP on for this device — the scanner
+                    (or remote Pi) should initiate its connection to that
+                    channel.  When <strong>Enabled</strong> is on and the
+                    device is paired, the listener is active.
                 </small>
             </div>
         </div>
@@ -316,16 +321,28 @@ function refreshDiscovered() {
                 tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-4">No devices discovered yet.</td></tr>';
                 return;
             }
-            tbody.innerHTML = devices.map(d => `
-                <tr>
+            tbody.innerHTML = devices.map(d => {
+                const pairedBadge = d.paired
+                    ? '<span class="badge bg-success">Yes</span>'
+                    : '<span class="badge bg-secondary">No</span>';
+                let actionCell;
+                if (d.plc_paired) {
+                    actionCell = '<span class="badge bg-warning text-dark" title="This device is paired on the PLC adapter — unpair it there before binding it as a device.">PLC — not usable here</span>';
+                } else if (d.paired) {
+                    actionCell = '';
+                } else {
+                    actionCell = `<button class="btn btn-sm btn-outline-success" onclick="pairDevice('${escAttr(d.address)}')"><i class="bi bi-link"></i> Pair</button>`;
+                }
+                const rowCls = d.plc_paired ? ' class="text-muted"' : '';
+                return `
+                <tr${rowCls}>
                     <td>${escHtml(d.name)}</td>
                     <td class="font-monospace">${escHtml(d.address)}</td>
-                    <td>${d.paired ? '<span class="badge bg-success">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td>
-                    <td>
-                        ${d.paired ? '' : `<button class="btn btn-sm btn-outline-success" onclick="pairDevice('${escAttr(d.address)}')"><i class="bi bi-link"></i> Pair</button>`}
-                    </td>
+                    <td>${pairedBadge}</td>
+                    <td>${actionCell}</td>
                 </tr>
-            `).join('');
+            `;
+            }).join('');
         });
 }
 
@@ -337,14 +354,44 @@ function refreshPaired() {
             const devices = data.devices || {};
             const entries = Object.entries(devices);
             if (!entries.length) {
-                tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-4">No paired devices.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" class="text-muted text-center py-4">No paired devices.</td></tr>';
                 return;
             }
-            tbody.innerHTML = entries.map(([addr, info]) => `
-                <tr>
-                    <td>${escHtml(info.name)}</td>
+            tbody.innerHTML = entries.map(([addr, info]) => {
+                const enabled = info.enabled !== false;
+                const listenCh = info.listen_channel != null ? info.listen_channel : 1;
+                const portCell = info.port != null
+                    ? '/dev/rfcomm' + info.port
+                    : '<span class="text-muted">(none)</span>';
+                const connDot = info.connected
+                    ? '<span class="status-dot connected" title="SPP connected"></span>'
+                    : '<span class="status-dot disconnected" title="Waiting for scanner"></span>';
+                return `
+                <tr${enabled ? '' : ' class="opacity-50"'}>
+                    <td>
+                        <div class="form-check form-switch mb-0">
+                            <input class="form-check-input" type="checkbox"
+                                   id="enabled-${addr.replace(/:/g,'-')}"
+                                   ${enabled ? 'checked' : ''}
+                                   onchange="toggleDeviceEnabled('${addr}', this.checked)">
+                        </div>
+                    </td>
+                    <td>${connDot}${escHtml(info.name)}</td>
                     <td class="font-monospace">${escHtml(addr)}</td>
-                    <td class="font-monospace">${info.port != null ? '/dev/rfcomm' + info.port : '<span class="text-muted">(none)</span>'}</td>
+                    <td>
+                        <div class="input-group input-group-sm" style="max-width:10rem;">
+                            <input type="number" min="1" max="30"
+                                   class="form-control text-end"
+                                   value="${listenCh}"
+                                   id="lch-${addr.replace(/:/g,'-')}">
+                            <button class="btn btn-outline-primary"
+                                    onclick="saveListenChannel('${addr}')"
+                                    title="Save channel">
+                                <i class="bi bi-check2"></i>
+                            </button>
+                        </div>
+                    </td>
+                    <td class="font-monospace">${portCell}</td>
                     <td>
                         <button class="btn btn-sm btn-outline-primary me-1"
                                 onclick="openRename('${addr}', '${escHtml(info.name)}')"
@@ -353,7 +400,7 @@ function refreshPaired() {
                         </button>
                         <button class="btn btn-sm btn-outline-secondary me-1"
                                 onclick="openPort('${addr}', ${info.port != null ? info.port : 'null'})"
-                                title="Change COM port">
+                                title="Change /dev/rfcomm port">
                             <i class="bi bi-hdd-network"></i>
                         </button>
                         <button class="btn btn-sm btn-outline-danger"
@@ -363,8 +410,39 @@ function refreshPaired() {
                         </button>
                     </td>
                 </tr>
-            `).join('');
+            `;
+            }).join('');
         });
+}
+
+function toggleDeviceEnabled(address, enabled) {
+    const urlAddr = address.replace(/:/g, '-');
+    fetch('/api/devices/' + urlAddr + '/enabled', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({enabled: enabled}),
+    }).then(r => r.json()).then(data => {
+        if (data.error) { alert(data.error); }
+        refreshPaired();
+    });
+}
+
+function saveListenChannel(address) {
+    const urlAddr = address.replace(/:/g, '-');
+    const input = document.getElementById('lch-' + urlAddr);
+    const channel = parseInt(input.value, 10);
+    if (isNaN(channel) || channel < 1 || channel > 30) {
+        alert('Listen channel must be between 1 and 30.');
+        return;
+    }
+    fetch('/api/devices/' + urlAddr + '/listen-channel', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({channel: channel}),
+    }).then(r => r.json()).then(data => {
+        if (data.error) { alert(data.error); return; }
+        refreshPaired();
+    });
 }
 
 function pairDevice(address) {

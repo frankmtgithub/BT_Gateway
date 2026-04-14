@@ -80,6 +80,22 @@ def _resolve_pairing_adapter(data=None):
     return current_app.gateway_config.get("device_adapter", "")
 
 
+def _plc_paired_address():
+    """Return the uppercase MAC of the device currently paired on the PLC
+    adapter, or '' if none / not configured.  Used to keep that device
+    from being re-paired on the devices adapter."""
+    plc_adapter = current_app.gateway_config.get("plc_adapter", "")
+    if not plc_adapter:
+        return ""
+    try:
+        paired = current_app.bt_manager.get_single_paired_device(plc_adapter)
+    except Exception:
+        return ""
+    if not paired:
+        return ""
+    return (paired.get("address") or "").upper()
+
+
 # ── Pairing API (device adapter) ─────────────────────────────────────────────
 
 @bp.route("/api/pairing/mode", methods=["GET"])
@@ -115,12 +131,23 @@ def api_pairing_disable():
 
 @bp.route("/api/pairing/devices")
 def api_pairing_devices():
-    """List discovered and paired devices on the requested adapter."""
+    """List discovered and paired devices on the requested adapter.
+
+    Each entry is annotated with ``plc_paired: true`` if that address is
+    the device currently paired on the PLC adapter — the UI uses this to
+    hide the Pair button and show a "PLC, not usable here" badge so the
+    user can't accidentally bind the same physical device to both sides.
+    """
     adapter_name = (request.args.get("adapter") or "").strip() \
         or current_app.gateway_config.get("device_adapter", "")
     if not adapter_name:
         return jsonify([])
     devices = current_app.bt_manager.list_devices(adapter_name)
+    plc_addr = _plc_paired_address()
+    for dev in devices:
+        dev["plc_paired"] = bool(plc_addr) and (
+            dev.get("address", "").upper() == plc_addr
+        )
     return jsonify(devices)
 
 
@@ -131,6 +158,16 @@ def api_pair_device():
     if not address:
         return jsonify({"error": "No address provided"}), 400
 
+    # Block: this device is already bound to the PLC adapter.  Pairing it
+    # here too would leave BlueZ with split-ownership confusion on the same
+    # physical device; force the user to unpair it from the PLC first.
+    if address.upper() == _plc_paired_address():
+        return jsonify({
+            "error": "This device is paired on the PLC adapter. "
+                     "Unpair it from the PLC side first if you want to use "
+                     "it as a device."
+        }), 409
+
     adapter_name = _resolve_pairing_adapter(data)
     success = current_app.bt_manager.pair_device(address, adapter_name)
     if success:
@@ -140,9 +177,14 @@ def api_pair_device():
         entry = current_app.gateway_config.add_device(address)
         name = entry["name"] if isinstance(entry, dict) else entry
         port = entry["port"] if isinstance(entry, dict) else None
+        # Bring up the SPP listener now so the scanner can initiate its
+        # side of the connection as soon as it switches to SPP mode.
+        current_app.device_server.refresh_profiles()
         return jsonify({
             "status": "paired", "name": name, "port": port,
             "adapter": adapter_name,
+            "enabled": entry.get("enabled", True) if isinstance(entry, dict) else True,
+            "listen_channel": entry.get("listen_channel", 1) if isinstance(entry, dict) else 1,
         })
     return jsonify({"error": "Pairing failed"}), 500
 
@@ -157,14 +199,15 @@ def api_remove_device():
     adapter_name = _resolve_pairing_adapter(data)
 
     # Disconnect if active
-    profile = current_app.device_server.profile
-    if profile:
-        profile._disconnect_device(address)
+    current_app.device_server.disconnect_device(address)
 
     # Remove from BlueZ
     current_app.bt_manager.remove_device(address, adapter_name)
     # Remove from config (also releases port)
     current_app.gateway_config.remove_device(address)
+    # The removed device may have been the only one using a given channel;
+    # close its SPP listener so BlueZ isn't advertising dead services.
+    current_app.device_server.refresh_profiles()
     return jsonify({"status": "removed"})
 
 
@@ -173,11 +216,9 @@ def api_remove_all():
     """Disconnect and unpair all devices."""
     data = request.get_json(silent=True) or {}
     adapter_name = _resolve_pairing_adapter(data)
-    profile = current_app.device_server.profile
 
     # Disconnect all active connections
-    if profile:
-        profile.disconnect_all()
+    current_app.device_server.disconnect_all()
 
     # Remove all from BlueZ
     devices = current_app.gateway_config.get_devices()
@@ -186,6 +227,7 @@ def api_remove_all():
 
     # Clear config
     current_app.gateway_config.remove_all_devices()
+    current_app.device_server.refresh_profiles()
     return jsonify({"status": "all_removed"})
 
 
@@ -278,6 +320,13 @@ def api_plc_pair():
         current_app.bt_manager.disconnect_profile(address, uuid, adapter)
     current_app.bt_manager.connect_profile(address, SPP_UUID, adapter)
     current_app.bt_manager.stop_discovery(adapter)
+    # The device we just claimed for the PLC side may have been previously
+    # paired on the devices adapter too.  Refresh SPP profile registrations
+    # so that device no longer has an active listener.
+    try:
+        current_app.device_server.refresh_profiles()
+    except Exception:
+        logger.exception("refresh_profiles after PLC pair failed")
     return jsonify({"status": "paired", "address": address.upper()})
 
 
@@ -290,6 +339,12 @@ def api_plc_unpair():
     if not paired:
         return jsonify({"status": "no_plc_paired"})
     current_app.bt_manager.remove_device(paired["address"], adapter)
+    # If this address is also a paired device, the PLC lockout for that
+    # device is now gone — reopen its SPP listener if it's enabled.
+    try:
+        current_app.device_server.refresh_profiles()
+    except Exception:
+        logger.exception("refresh_profiles after PLC unpair failed")
     return jsonify({"status": "unpaired", "address": paired["address"]})
 
 
@@ -392,6 +447,51 @@ def api_rename_device(address):
     if success:
         return jsonify({"status": "renamed", "name": new_name})
     return jsonify({"error": "Device not found"}), 404
+
+
+# ── Device enable / listen-channel API ──────────────────────────────────────
+
+@bp.route("/api/devices/<address>/enabled", methods=["POST"])
+def api_set_device_enabled(address):
+    """Toggle whether the gateway accepts SPP connections from this device.
+
+    When enabled=true, the SPP profile for this device's listen channel is
+    registered with BlueZ (if not already).  When enabled=false, incoming
+    connections from this device are rejected, and the listener for its
+    channel is torn down if no other enabled device still uses it.
+    """
+    address = address.replace("-", ":").upper()
+    data = request.get_json() or {}
+    enabled = bool(data.get("enabled"))
+    if not current_app.gateway_config.set_device_enabled(address, enabled):
+        return jsonify({"error": "Device not found"}), 404
+    # If we just disabled an active connection, drop it now.
+    if not enabled:
+        current_app.device_server.disconnect_device(address)
+    current_app.device_server.refresh_profiles()
+    return jsonify({"status": "ok", "enabled": enabled})
+
+
+@bp.route("/api/devices/<address>/listen-channel", methods=["POST"])
+def api_set_device_listen_channel(address):
+    """Set the RFCOMM channel this device's SPP listener uses (1-30).
+
+    The scanner / remote Pi firmware is normally configured to hit a
+    specific channel (the Windows "COM port" of the remote side), so each
+    device may want its own listen channel on the gateway.
+    """
+    address = address.replace("-", ":").upper()
+    data = request.get_json() or {}
+    try:
+        channel = int(data.get("channel"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid channel"}), 400
+    if not current_app.gateway_config.set_device_listen_channel(address, channel):
+        return jsonify({
+            "error": "Channel must be an integer between 1 and 30"
+        }), 400
+    current_app.device_server.refresh_profiles()
+    return jsonify({"status": "ok", "listen_channel": channel})
 
 
 # ── Restart (for wizard adapter re-selection) ───────────────────────────────

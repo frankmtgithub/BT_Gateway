@@ -15,6 +15,12 @@ logger = logging.getLogger(__name__)
 PORT_MIN = 0
 PORT_MAX = 30
 
+# Range of RFCOMM channels we advertise SPP on for paired devices.
+# RFCOMM channels are 1..30 on classic Bluetooth.
+LISTEN_CHANNEL_MIN = 1
+LISTEN_CHANNEL_MAX = 30
+DEFAULT_LISTEN_CHANNEL = 1
+
 DEFAULT_CONFIG = {
     "plc_adapter": "",
     "device_adapter": "",
@@ -43,9 +49,19 @@ class Config:
             "AA:BB:CC:DD:EE:FF": {
                 "name": "connection1",
                 "paired": true,
-                "port": 1
+                "port": 1,
+                "enabled": true,
+                "listen_channel": 1
             }
         }
+
+    ``enabled`` controls whether the gateway accepts SPP connections from
+    this device — when false, the matching listening channel is closed and
+    inbound RFCOMM connections from this address are rejected.
+
+    ``listen_channel`` is the RFCOMM channel on the device adapter that
+    this device should hit when it initiates its SPP connection (the
+    "COM port" the scanner or remote Pi expects to find on the gateway).
     """
 
     def __init__(self, config_path="/data/config.json"):
@@ -84,6 +100,14 @@ class Config:
                                 used.add(next_free)
                                 migrated = True
                                 next_free += 1
+                        # Backfill the newer enabled / listen_channel fields.
+                        if "enabled" not in dev:
+                            dev["enabled"] = True
+                            migrated = True
+                        if "listen_channel" not in dev or \
+                                not self._is_valid_listen_channel(dev.get("listen_channel")):
+                            dev["listen_channel"] = DEFAULT_LISTEN_CHANNEL
+                            migrated = True
                     if migrated:
                         self._save_unlocked()
                     logger.info("Configuration loaded from %s", self.config_path)
@@ -146,6 +170,8 @@ class Config:
                 "name": name,
                 "paired": True,
                 "port": port,
+                "enabled": True,
+                "listen_channel": DEFAULT_LISTEN_CHANNEL,
             }
             self._save_unlocked()
             logger.info("Device added: %s as %s on port %s", address, name, port)
@@ -216,6 +242,55 @@ class Config:
         with self._lock:
             dev = self._data["devices"].get(address)
             return dev.get("port") if dev else None
+
+    # ── Enabled / listen-channel (per-device SPP listener config) ──────
+
+    def set_device_enabled(self, address, enabled):
+        """Enable or disable the SPP listener for a specific device."""
+        with self._lock:
+            if address not in self._data["devices"]:
+                return False
+            self._data["devices"][address]["enabled"] = bool(enabled)
+            self._save_unlocked()
+            logger.info("Device %s enabled=%s", address, bool(enabled))
+            return True
+
+    def set_device_listen_channel(self, address, channel):
+        """Change the RFCOMM channel we advertise SPP on for this device.
+
+        Returns True on success, False if the device is unknown or the
+        channel is out of range (1-30).
+        """
+        try:
+            channel = int(channel)
+        except (TypeError, ValueError):
+            return False
+        if not self._is_valid_listen_channel(channel):
+            return False
+        with self._lock:
+            if address not in self._data["devices"]:
+                return False
+            self._data["devices"][address]["listen_channel"] = channel
+            self._save_unlocked()
+            logger.info("Device %s listen_channel=%d", address, channel)
+            return True
+
+    def get_enabled_devices(self):
+        """Return a dict of only the devices marked enabled."""
+        with self._lock:
+            return {
+                addr: dict(dev)
+                for addr, dev in self._data.get("devices", {}).items()
+                if dev.get("enabled", True)
+            }
+
+    @staticmethod
+    def _is_valid_listen_channel(channel):
+        try:
+            n = int(channel)
+        except (TypeError, ValueError):
+            return False
+        return LISTEN_CHANNEL_MIN <= n <= LISTEN_CHANNEL_MAX
 
     # ── Port management ────────────────────────────────────────────────
 
