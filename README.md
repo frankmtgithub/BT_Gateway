@@ -22,22 +22,50 @@ to a PLC over Serial Port Profile (SPP), with a web-based management interface.
 ## Quick Start (Docker)
 
 ```bash
-# Build and run
-docker compose up -d
+# One-time host setup (disables BlueZ HID plugin, enables docker at
+# boot, adds a desktop autostart entry that opens the web UI).
+sudo ./scripts/install-host.sh
+
+# Build and run the gateway
+docker compose up -d --build
 
 # View logs
 docker compose logs -f bt-gateway
 ```
 
-The web interface is available at `http://<pi-ip>:8080`.
+The web interface is available at `http://<pi-ip>:8080` and will also
+pop open automatically when you log into the Pi's desktop. The
+`restart: unless-stopped` policy in `docker-compose.yml` keeps the
+container running across reboots and crashes.
 
 ### First-time Setup
 
-1. Open the web UI and go to **Settings**
+1. Open the web UI and go to **Settings** (or the **Setup Wizard**)
 2. Select the **PLC Adapter** and **Device Adapter** from detected hardware
-3. Enter the PLC Bluetooth address and RFCOMM channel
+3. Enter the PLC's Windows COM port label (e.g. `COM6`). The RFCOMM channel
+   is auto-discovered from the PLC's SDP — no need to set it manually
 4. Save and restart the container: `docker compose restart`
 5. Go to **Pairing**, enable pairing mode, and pair your devices
+
+### Honeywell 8675i (and other HID-capable scanners)
+
+Barcode scanners typically ship in **Bluetooth HID Keyboard** mode by
+default, which means scanned data is delivered to the host as
+keystrokes, not as serial data — you'll see URL barcodes opening a
+browser rather than showing up in the Message Log.
+
+To use the scanner with this gateway you must switch it to **Bluetooth
+SPP mode** by scanning the "Serial Port Profile" programming barcode
+from the scanner's User's Guide. After that:
+
+- The scanner drops its HID profile and only advertises SPP
+- The gateway's auto-connect loop will bring up SPP every few seconds
+  without any desktop-side "Connect" click
+- Scanned data shows up in the Message Log (and is forwarded to the PLC)
+
+`scripts/install-host.sh` also disables BlueZ's HID input plugin as a
+belt-and-suspenders measure, so even if the scanner is still in HID
+mode it can't generate keystrokes on the Pi.
 
 ## Running Without Docker
 
@@ -102,5 +130,8 @@ bt_gateway/
     static/          — CSS and JavaScript
 Dockerfile
 docker-compose.yml
+scripts/
+  install-host.sh    — One-time host setup (BlueZ HID disable,
+                       docker-at-boot, desktop autostart for web UI)
 run.py               — Entry point
 ```

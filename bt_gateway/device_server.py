@@ -15,6 +15,7 @@ import logging
 import os
 import socket
 import threading
+import time
 
 import dbus
 import dbus.service
@@ -31,6 +32,12 @@ SPP_UUID = "00001101-0000-1000-8000-00805f9b34fb"
 HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
 PROFILE_PATH_BASE = "/org/bluez/btgateway/spp_profile"
 RECV_BUFFER = 4096
+
+# How often the auto-connect thread probes enabled paired devices that
+# aren't currently connected.  Short enough that a scanner coming into
+# range establishes its SPP link within a few seconds without the user
+# having to click anything.
+AUTO_CONNECT_INTERVAL = 10
 
 
 class DeviceConnection:
@@ -208,6 +215,11 @@ class DeviceServer:
         self._lock = threading.Lock()
         self._pairing_mode = False
         self._started = False
+        # Background auto-connect thread bringing enabled paired devices
+        # back onto SPP without user intervention (and killing HID so
+        # scanners don't act as keyboards).
+        self._auto_connect_thread = None
+        self._auto_connect_running = False
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -222,13 +234,18 @@ class DeviceServer:
         self._bt_manager.power_adapter(adapter_name, True)
         self._started = True
         self.refresh_profiles()
+        self._start_auto_connect()
         return True
 
     def stop(self):
+        self._auto_connect_running = False
         self.disconnect_all()
         self._unregister_all_profiles()
         self.set_pairing_mode(False)
         self._started = False
+        if self._auto_connect_thread:
+            self._auto_connect_thread.join(timeout=3)
+            self._auto_connect_thread = None
 
     # ── Profile registration (one per listen channel in use) ───────────
 
@@ -423,6 +440,68 @@ class DeviceServer:
         if not plc_dev:
             return False
         return plc_dev.get("address", "").upper() == address.upper()
+
+    # ── Auto-connect loop ──────────────────────────────────────────────
+
+    def _start_auto_connect(self):
+        """Spawn a background thread that periodically nudges enabled
+        paired devices onto SPP when they aren't currently connected.
+
+        Scanners that are configured for SPP mode typically wait for the
+        host (the Pi) to initiate the RFCOMM connection rather than doing
+        it themselves, so calling BlueZ ``ConnectProfile(SPP)`` from our
+        side is what brings the link up without the user clicking
+        "connect" in the desktop Bluetooth applet.  We also hammer
+        ``DisconnectProfile(HID)`` so a scanner that's still in keyboard
+        mode doesn't leave stray HID state connected on the gateway.
+        """
+        if self._auto_connect_thread and self._auto_connect_thread.is_alive():
+            return
+        self._auto_connect_running = True
+        self._auto_connect_thread = threading.Thread(
+            target=self._auto_connect_loop,
+            daemon=True,
+            name="device-auto-connect",
+        )
+        self._auto_connect_thread.start()
+
+    def _auto_connect_loop(self):
+        logger.info("Device auto-connect thread started (interval %ds)",
+                    AUTO_CONNECT_INTERVAL)
+        while self._auto_connect_running:
+            try:
+                self._auto_connect_tick()
+            except Exception:
+                logger.exception("auto-connect tick failed")
+            # Interruptible sleep
+            deadline = time.monotonic() + AUTO_CONNECT_INTERVAL
+            while self._auto_connect_running and time.monotonic() < deadline:
+                time.sleep(0.5)
+        logger.info("Device auto-connect thread stopped")
+
+    def _auto_connect_tick(self):
+        """One iteration of the auto-connect loop — called on a schedule."""
+        adapter_name = self._config.get("device_adapter", "")
+        if not adapter_name:
+            return
+
+        # Snapshot the connected set under lock, then work outside it.
+        with self._lock:
+            connected = set(self._connections.keys())
+
+        for addr, dev in self._config.get_enabled_devices().items():
+            if self._is_plc_paired_address(addr):
+                continue
+            if addr in connected:
+                # Already happily streaming — just keep HID off in case
+                # BlueZ opportunistically reopened it in the background.
+                self._bt_manager.disconnect_profile(addr, HID_UUID, adapter_name)
+                continue
+            # Try to bring SPP up.  Belt-and-suspenders: drop HID first so
+            # BlueZ doesn't "already-connected" us via the wrong profile.
+            logger.debug("Auto-connect: attempting SPP on %s", addr)
+            self._bt_manager.disconnect_profile(addr, HID_UUID, adapter_name)
+            self._bt_manager.connect_profile(addr, SPP_UUID, adapter_name)
 
     def set_pairing_mode(self, enabled, adapter_name=None):
         """Enable or disable pairing mode (discoverable + pairable).
