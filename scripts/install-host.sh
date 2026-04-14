@@ -108,7 +108,10 @@ LAUNCHER="${LAUNCHER_DIR}/bt-gateway-open-ui.sh"
 mkdir -p "${AUTOSTART_DIR}" "${LAUNCHER_DIR}"
 
 # Launcher: wait until the Flask port is accepting connections, then
-# open the default browser unless a window is already on that URL.
+# open the web UI in Chromium (directly, not via xdg-open) with
+# --password-store=basic so it does NOT try to unlock the GNOME keyring
+# on first launch — that keyring unlock is the "please authenticate"
+# prompt people hit on a fresh Raspberry Pi OS desktop.
 cat > "${LAUNCHER}" <<'EOF'
 #!/usr/bin/env bash
 # Opens the BT Gateway web UI once the container is accepting traffic.
@@ -130,6 +133,30 @@ if command -v xdotool >/dev/null 2>&1; then
     fi
 fi
 
+# Prefer Chromium directly — the usual default browser on Raspberry Pi
+# OS.  Passing --password-store=basic stops Chromium from asking the
+# desktop keyring to unlock on first run (that's the "authentication"
+# dialog with the password field that blocks the autostart otherwise).
+# --no-first-run / --no-default-browser-check skip the welcome tour.
+for BROWSER in chromium-browser chromium google-chrome firefox; do
+    if command -v "${BROWSER}" >/dev/null 2>&1; then
+        case "${BROWSER}" in
+            chromium-browser|chromium|google-chrome)
+                nohup "${BROWSER}" \
+                    --password-store=basic \
+                    --no-first-run \
+                    --no-default-browser-check \
+                    "${URL}" >/dev/null 2>&1 &
+                ;;
+            *)
+                nohup "${BROWSER}" "${URL}" >/dev/null 2>&1 &
+                ;;
+        esac
+        exit 0
+    fi
+done
+
+# Last-ditch fallback if no known browser was found.
 xdg-open "${URL}" >/dev/null 2>&1 || true
 EOF
 chmod +x "${LAUNCHER}"
@@ -143,8 +170,10 @@ Comment=Open the BT Gateway web interface at http://localhost:8080
 Exec=${LAUNCHER}
 Terminal=false
 X-GNOME-Autostart-enabled=true
-# Small delay so the desktop has settled before we open a browser.
-X-GNOME-Autostart-Delay=5
+# Longer delay so the desktop (and its keyring agent) has fully
+# settled before we fire up a browser — avoids the first-run
+# keyring-unlock dialog that otherwise blocks the page from opening.
+X-GNOME-Autostart-Delay=10
 EOF
 chown -R "${TARGET_USER}:${TARGET_USER}" \
     "${TARGET_HOME}/.config/autostart" "${TARGET_HOME}/.local/bin"

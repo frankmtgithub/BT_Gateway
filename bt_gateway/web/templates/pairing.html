@@ -46,8 +46,25 @@
     <!-- Discovered Devices -->
     <div class="col-12">
         <div class="card">
-            <div class="card-header">
+            <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
                 <h5 class="mb-0"><i class="bi bi-search"></i> Discovered Devices</h5>
+                <div class="input-group input-group-sm" style="max-width: 18rem;">
+                    <span class="input-group-text" id="discovered-filter-label">
+                        <i class="bi bi-funnel"></i>
+                    </span>
+                    <input type="text"
+                           class="form-control"
+                           id="discovered-filter"
+                           placeholder="Filter by name prefix…"
+                           aria-label="Filter by name prefix"
+                           aria-describedby="discovered-filter-label">
+                    <button class="btn btn-outline-secondary"
+                            type="button"
+                            id="discovered-filter-clear"
+                            title="Clear filter">
+                        <i class="bi bi-x"></i>
+                    </button>
+                </div>
             </div>
             <div class="card-body">
                 <div class="table-responsive">
@@ -69,6 +86,11 @@
                         </tbody>
                     </table>
                 </div>
+                <small class="text-muted d-block mt-2">
+                    <i class="bi bi-info-circle"></i>
+                    Entries whose name starts with the filter text are
+                    shown at the top of the list.
+                </small>
             </div>
         </div>
     </div>
@@ -179,9 +201,20 @@ document.addEventListener('DOMContentLoaded', function() {
     const renameSaveBtn = document.getElementById('rename-save-btn');
     const portSaveBtn = document.getElementById('port-save-btn');
     const adapterSelect = document.getElementById('pairing-adapter-select');
+    const filterInput = document.getElementById('discovered-filter');
+    const filterClearBtn = document.getElementById('discovered-filter-clear');
 
     // Refresh device list whenever the adapter selection changes
     adapterSelect.addEventListener('change', refreshDiscovered);
+
+    // Re-render in place when the filter text changes so name-prefix
+    // matches float to the top of the list.  We don't re-fetch — just
+    // re-sort whatever was last fetched (cached in window._discovered).
+    filterInput.addEventListener('input', renderDiscovered);
+    filterClearBtn.addEventListener('click', function() {
+        filterInput.value = '';
+        renderDiscovered();
+    });
 
     enableBtn.addEventListener('click', function() {
         const adapter = currentPairingAdapter();
@@ -316,34 +349,64 @@ function refreshDiscovered() {
     fetch(url)
         .then(r => r.json())
         .then(devices => {
-            const tbody = document.getElementById('discovered-tbody');
-            if (!devices.length) {
-                tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-4">No devices discovered yet.</td></tr>';
-                return;
-            }
-            tbody.innerHTML = devices.map(d => {
-                const pairedBadge = d.paired
-                    ? '<span class="badge bg-success">Yes</span>'
-                    : '<span class="badge bg-secondary">No</span>';
-                let actionCell;
-                if (d.plc_paired) {
-                    actionCell = '<span class="badge bg-warning text-dark" title="This device is paired on the PLC adapter — unpair it there before binding it as a device.">PLC — not usable here</span>';
-                } else if (d.paired) {
-                    actionCell = '';
-                } else {
-                    actionCell = `<button class="btn btn-sm btn-outline-success" onclick="pairDevice('${escAttr(d.address)}')"><i class="bi bi-link"></i> Pair</button>`;
-                }
-                const rowCls = d.plc_paired ? ' class="text-muted"' : '';
-                return `
-                <tr${rowCls}>
-                    <td>${escHtml(d.name)}</td>
-                    <td class="font-monospace">${escHtml(d.address)}</td>
-                    <td>${pairedBadge}</td>
-                    <td>${actionCell}</td>
-                </tr>
-            `;
-            }).join('');
+            // Cache the last fetched list so the filter input can
+            // re-render without re-hitting the API.
+            window._discovered = Array.isArray(devices) ? devices : [];
+            renderDiscovered();
         });
+}
+
+function renderDiscovered() {
+    const tbody = document.getElementById('discovered-tbody');
+    const devices = Array.isArray(window._discovered) ? window._discovered : [];
+    if (!devices.length) {
+        tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-4">No devices discovered yet.</td></tr>';
+        return;
+    }
+
+    // Stable sort: devices whose name starts with the filter prefix
+    // (case-insensitive) float to the top; everything else keeps its
+    // original order.  Empty filter = no reordering.
+    const filterEl = document.getElementById('discovered-filter');
+    const filter = (filterEl && filterEl.value ? filterEl.value : '').trim().toLowerCase();
+    let sorted = devices;
+    if (filter) {
+        sorted = devices
+            .map((d, i) => ({ d: d, i: i,
+                match: (d.name || '').toLowerCase().startsWith(filter) }))
+            .sort((a, b) => {
+                if (a.match !== b.match) return a.match ? -1 : 1;
+                return a.i - b.i;
+            })
+            .map(x => x.d);
+    }
+
+    tbody.innerHTML = sorted.map(d => {
+        const pairedBadge = d.paired
+            ? '<span class="badge bg-success">Yes</span>'
+            : '<span class="badge bg-secondary">No</span>';
+        let actionCell;
+        if (d.plc_paired) {
+            actionCell = '<span class="badge bg-warning text-dark" title="This device is paired on the PLC adapter — unpair it there before binding it as a device.">PLC — not usable here</span>';
+        } else if (d.paired) {
+            actionCell = '';
+        } else {
+            actionCell = `<button class="btn btn-sm btn-outline-success" onclick="pairDevice('${escAttr(d.address)}')"><i class="bi bi-link"></i> Pair</button>`;
+        }
+        // Highlight matching rows so the filter effect is obvious.
+        const matches = filter && (d.name || '').toLowerCase().startsWith(filter);
+        let rowCls = '';
+        if (d.plc_paired) rowCls = ' class="text-muted"';
+        else if (matches) rowCls = ' class="table-primary"';
+        return `
+        <tr${rowCls}>
+            <td>${escHtml(d.name)}</td>
+            <td class="font-monospace">${escHtml(d.address)}</td>
+            <td>${pairedBadge}</td>
+            <td>${actionCell}</td>
+        </tr>
+    `;
+    }).join('');
 }
 
 function refreshPaired() {
