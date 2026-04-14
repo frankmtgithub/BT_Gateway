@@ -29,7 +29,7 @@ except ImportError:
 
 SPP_UUID = "00001101-0000-1000-8000-00805f9b34fb"
 HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
-PROFILE_PATH = "/org/bluez/btgateway/spp_profile"
+PROFILE_PATH_BASE = "/org/bluez/btgateway/spp_profile"
 RECV_BUFFER = 4096
 
 
@@ -110,18 +110,22 @@ class DeviceConnection:
 class SPPProfile(dbus.service.Object):
     """BlueZ Profile1 implementation for the SPP server.
 
-    BlueZ calls NewConnection when a remote device opens an RFCOMM channel
-    to our registered SPP service.
+    One instance is registered per RFCOMM channel that at least one enabled
+    paired device wants to listen on.  BlueZ calls NewConnection on the
+    instance whose channel matches the one the remote device hit.
     """
 
-    def __init__(self, bus, config, router, bt_manager, socketio=None):
-        self._config = config
-        self._router = router
-        self._bt_manager = bt_manager
-        self._socketio = socketio
-        self._connections = {}  # address -> DeviceConnection
-        self._lock = threading.Lock()
-        super().__init__(bus, PROFILE_PATH)
+    def __init__(self, bus, path, channel, owner):
+        """``owner`` is the :class:`DeviceServer` that created us.  We route
+        the accepted connections back to it so it can keep a single
+        address → DeviceConnection map shared across every channel."""
+        self._channel = int(channel)
+        self._owner = owner
+        super().__init__(bus, path)
+
+    @property
+    def channel(self):
+        return self._channel
 
     @dbus.service.method("org.bluez.Profile1",
                          in_signature="oha{sv}", out_signature="")
@@ -134,7 +138,8 @@ class SPPProfile(dbus.service.Object):
         else:
             address = addr_part
 
-        logger.info("New device connection from %s (path: %s)", address, device_path)
+        logger.info("New device connection from %s on channel %d (path: %s)",
+                    address, self._channel, device_path)
 
         # Take ownership of the file descriptor
         if hasattr(fd, "take"):
@@ -142,16 +147,196 @@ class SPPProfile(dbus.service.Object):
         else:
             fd_num = int(fd)
 
+        # Gate: is this connection allowed?  We check gating BEFORE turning
+        # the fd into a socket so the reject path is a single close().
+        reason = self._owner.check_connection_allowed(address, self._channel)
+        if reason:
+            logger.warning("Rejecting connection from %s on channel %d: %s",
+                           address, self._channel, reason)
+            try:
+                os.close(fd_num)
+            except OSError:
+                pass
+            return
+
         # Create a socket from the file descriptor
         try:
             sock = socket.fromfd(fd_num, AF_BLUETOOTH, socket.SOCK_STREAM, BTPROTO_RFCOMM)
             os.close(fd_num)  # fromfd dups the fd
         except OSError as e:
             logger.error("Failed to create socket from fd for %s: %s", address, e)
-            os.close(fd_num)
+            try:
+                os.close(fd_num)
+            except OSError:
+                pass
             return
 
-        # Register device in config if not already present
+        self._owner.accept_connection(address, sock)
+
+    @dbus.service.method("org.bluez.Profile1",
+                         in_signature="o", out_signature="")
+    def RequestDisconnection(self, device_path):
+        addr_part = device_path.split("/")[-1]
+        if addr_part.startswith("dev_"):
+            address = addr_part[4:].replace("_", ":").upper()
+        else:
+            address = addr_part
+        logger.info("Disconnection requested for %s (channel %d)",
+                    address, self._channel)
+        self._owner.disconnect_device(address)
+
+    @dbus.service.method("org.bluez.Profile1",
+                         in_signature="", out_signature="")
+    def Release(self):
+        logger.info("SPP Profile on channel %d released by BlueZ",
+                    self._channel)
+
+
+class DeviceServer:
+    """Manages the SPP server lifecycle: per-channel profile registration,
+    device connection accounting, and pairing mode."""
+
+    def __init__(self, config, router, bt_manager, socketio=None):
+        self._config = config
+        self._router = router
+        self._bt_manager = bt_manager
+        self._socketio = socketio
+        # channel (int) -> SPPProfile
+        self._profiles = {}
+        # BT address -> DeviceConnection
+        self._connections = {}
+        self._lock = threading.Lock()
+        self._pairing_mode = False
+        self._started = False
+
+    # ── Lifecycle ──────────────────────────────────────────────────────
+
+    def start(self):
+        """Power on the device adapter and register SPP profiles for every
+        enabled paired device's listen channel."""
+        adapter_name = self._config.get("device_adapter", "")
+        if not adapter_name:
+            logger.warning("No device adapter configured")
+            return False
+
+        self._bt_manager.power_adapter(adapter_name, True)
+        self._started = True
+        self.refresh_profiles()
+        return True
+
+    def stop(self):
+        self.disconnect_all()
+        self._unregister_all_profiles()
+        self.set_pairing_mode(False)
+        self._started = False
+
+    # ── Profile registration (one per listen channel in use) ───────────
+
+    def refresh_profiles(self):
+        """Recompute the set of RFCOMM channels we need to listen on from
+        the enabled-devices list and bring registrations into alignment.
+
+        Always called after any change to devices, enabled flags, or
+        listen channels so the BlueZ SDP record reflects reality.
+        """
+        if not self._started:
+            return
+
+        desired = set()
+        for addr, dev in self._config.get_enabled_devices().items():
+            if self._is_plc_paired_address(addr):
+                # Never expose SPP for a device that's paired on the PLC
+                # adapter — that device belongs to the PLC side.
+                continue
+            channel = int(dev.get("listen_channel") or 0)
+            if 1 <= channel <= 30:
+                desired.add(channel)
+
+        with self._lock:
+            current = set(self._profiles.keys())
+
+        # Register any newly-needed channels
+        for channel in sorted(desired - current):
+            self._register_profile(channel)
+
+        # Unregister channels we no longer need
+        for channel in sorted(current - desired):
+            self._unregister_profile(channel)
+
+    def _register_profile(self, channel):
+        path = f"{PROFILE_PATH_BASE}_ch{channel}"
+        try:
+            profile = SPPProfile(self._bt_manager.bus, path, channel, self)
+            manager = dbus.Interface(
+                self._bt_manager.bus.get_object("org.bluez", "/org/bluez"),
+                "org.bluez.ProfileManager1",
+            )
+            opts = {
+                "Name": dbus.String(f"BT Gateway SPP (ch{channel})"),
+                "Role": dbus.String("server"),
+                "Channel": dbus.UInt16(channel),
+                "AutoConnect": dbus.Boolean(False),
+                "RequireAuthentication": dbus.Boolean(False),
+                "RequireAuthorization": dbus.Boolean(False),
+            }
+            manager.RegisterProfile(path, SPP_UUID, opts)
+            with self._lock:
+                self._profiles[channel] = profile
+            logger.info("SPP profile registered on RFCOMM channel %d", channel)
+        except dbus.DBusException as e:
+            logger.error("Failed to register SPP profile on channel %d: %s",
+                         channel, e)
+
+    def _unregister_profile(self, channel):
+        with self._lock:
+            profile = self._profiles.pop(channel, None)
+        if profile is None:
+            return
+        path = f"{PROFILE_PATH_BASE}_ch{channel}"
+        try:
+            manager = dbus.Interface(
+                self._bt_manager.bus.get_object("org.bluez", "/org/bluez"),
+                "org.bluez.ProfileManager1",
+            )
+            manager.UnregisterProfile(path)
+            logger.info("SPP profile unregistered on RFCOMM channel %d", channel)
+        except dbus.DBusException as e:
+            logger.warning("UnregisterProfile on channel %d failed: %s",
+                           channel, e)
+        try:
+            profile.remove_from_connection()
+        except Exception:
+            pass
+
+    def _unregister_all_profiles(self):
+        with self._lock:
+            channels = list(self._profiles.keys())
+        for channel in channels:
+            self._unregister_profile(channel)
+
+    # ── Connection gate (called by SPPProfile.NewConnection) ───────────
+
+    def check_connection_allowed(self, address, channel):
+        """Return None if the device is allowed to connect on this channel,
+        otherwise a short human-readable reason string."""
+        if self._is_plc_paired_address(address):
+            return "device is paired on PLC adapter"
+        devices = self._config.get_devices()
+        dev = devices.get(address)
+        if dev is None:
+            return "device not paired with this gateway"
+        if not dev.get("enabled", True):
+            return "device is disabled"
+        configured = int(dev.get("listen_channel") or 0)
+        if configured and configured != channel:
+            return f"device configured for channel {configured}, got {channel}"
+        return None
+
+    def accept_connection(self, address, sock):
+        """Finalise an accepted SPP connection from a remote device."""
+        # Auto-register the device if it isn't in config yet.  (Shouldn't
+        # happen — check_connection_allowed rejects unknowns — but keep as
+        # a safety net so we never drop data.)
         device_entry = self._config.add_device(address)
         device_name = device_entry["name"] if isinstance(device_entry, dict) \
             else device_entry
@@ -163,7 +348,6 @@ class SPPProfile(dbus.service.Object):
         adapter_name = self._config.get("device_adapter", "")
         self._bt_manager.disconnect_profile(address, HID_UUID, adapter_name)
 
-        # Create and start the device connection handler
         conn = DeviceConnection(
             address=address,
             sock=sock,
@@ -173,7 +357,6 @@ class SPPProfile(dbus.service.Object):
         )
 
         with self._lock:
-            # Close existing connection from same device if any
             old_conn = self._connections.get(address)
             if old_conn:
                 logger.info("Replacing existing connection from %s", address)
@@ -190,35 +373,18 @@ class SPPProfile(dbus.service.Object):
                 "name": device_name,
             }, namespace="/")
 
-    @dbus.service.method("org.bluez.Profile1",
-                         in_signature="o", out_signature="")
-    def RequestDisconnection(self, device_path):
-        addr_part = device_path.split("/")[-1]
-        if addr_part.startswith("dev_"):
-            address = addr_part[4:].replace("_", ":").upper()
-        else:
-            address = addr_part
-        logger.info("Disconnection requested for %s", address)
-        self._disconnect_device(address)
-
-    @dbus.service.method("org.bluez.Profile1",
-                         in_signature="", out_signature="")
-    def Release(self):
-        logger.info("SPP Profile released by BlueZ")
+    # ── Connection accounting ──────────────────────────────────────────
 
     def _on_device_data(self, address, data):
-        """Called by a DeviceConnection reader thread when data arrives."""
         self._router.route_from_device(address, data)
 
     def _on_device_raw(self, address, raw_chunk):
-        """Debug notification of a raw chunk from a device."""
         self._router.notify_device_raw(address, raw_chunk)
 
     def _on_device_disconnect(self, address):
-        """Called when a device connection drops."""
-        self._disconnect_device(address)
+        self.disconnect_device(address)
 
-    def _disconnect_device(self, address):
+    def disconnect_device(self, address):
         with self._lock:
             conn = self._connections.pop(address, None)
         if conn:
@@ -233,71 +399,30 @@ class SPPProfile(dbus.service.Object):
             }, namespace="/")
 
     def disconnect_all(self):
-        """Disconnect all active device connections."""
         with self._lock:
             addresses = list(self._connections.keys())
         for addr in addresses:
-            self._disconnect_device(addr)
+            self.disconnect_device(addr)
 
     def get_active_connections(self):
         with self._lock:
             return list(self._connections.keys())
 
+    # ── Misc ───────────────────────────────────────────────────────────
 
-class DeviceServer:
-    """Manages the SPP server lifecycle: profile registration, pairing mode."""
-
-    def __init__(self, config, router, bt_manager, socketio=None):
-        self._config = config
-        self._router = router
-        self._bt_manager = bt_manager
-        self._socketio = socketio
-        self._profile = None
-        self._pairing_mode = False
-
-    def start(self):
-        """Register the SPP profile with BlueZ and power on the device adapter."""
-        adapter_name = self._config.get("device_adapter", "")
-        if not adapter_name:
-            logger.warning("No device adapter configured")
+    def _is_plc_paired_address(self, address):
+        """True if ``address`` is the single PLC-paired device on the PLC
+        adapter.  Used to lock this device out of the devices side entirely."""
+        plc_adapter = self._config.get("plc_adapter", "")
+        if not plc_adapter:
             return False
-
-        # Power on the adapter
-        self._bt_manager.power_adapter(adapter_name, True)
-
-        # Register SPP Profile
-        self._profile = SPPProfile(
-            self._bt_manager.bus,
-            self._config,
-            self._router,
-            self._bt_manager,
-            self._socketio,
-        )
-
         try:
-            manager = dbus.Interface(
-                self._bt_manager.bus.get_object("org.bluez", "/org/bluez"),
-                "org.bluez.ProfileManager1",
-            )
-            opts = {
-                "Name": dbus.String("BT Gateway SPP"),
-                "Role": dbus.String("server"),
-                "Channel": dbus.UInt16(1),
-                "AutoConnect": dbus.Boolean(False),
-                "RequireAuthentication": dbus.Boolean(False),
-                "RequireAuthorization": dbus.Boolean(False),
-            }
-            manager.RegisterProfile(PROFILE_PATH, SPP_UUID, opts)
-            logger.info("SPP Profile registered on %s", adapter_name)
-            return True
-        except dbus.DBusException as e:
-            logger.error("Failed to register SPP profile: %s", e)
+            plc_dev = self._bt_manager.get_single_paired_device(plc_adapter)
+        except Exception:
             return False
-
-    def stop(self):
-        if self._profile:
-            self._profile.disconnect_all()
-        self.set_pairing_mode(False)
+        if not plc_dev:
+            return False
+        return plc_dev.get("address", "").upper() == address.upper()
 
     def set_pairing_mode(self, enabled, adapter_name=None):
         """Enable or disable pairing mode (discoverable + pairable).
@@ -329,5 +454,6 @@ class DeviceServer:
         return self._pairing_mode
 
     @property
-    def profile(self):
-        return self._profile
+    def listening_channels(self):
+        with self._lock:
+            return sorted(self._profiles.keys())

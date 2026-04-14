@@ -101,7 +101,7 @@ function updateDashboard(data) {
     refreshLogFilter();
 
     if (!entries.length) {
-        tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-4">' +
+        tbody.innerHTML = '<tr><td colspan="5" class="text-muted text-center py-4">' +
             'No devices configured. Go to <a href="/pairing">Pairing</a> to add devices.' +
             '</td></tr>';
         updateDeviceCount(0);
@@ -111,14 +111,27 @@ function updateDashboard(data) {
     let connectedCount = 0;
     tbody.innerHTML = entries.map(function([addr, info]) {
         const connected = info.connected;
+        const enabled = info.enabled !== false;
         if (connected) connectedCount++;
-        const statusClass = connected ? 'connected' : 'disconnected';
-        const statusText = connected ? 'Connected' : 'Disconnected';
+        let statusClass, statusText;
+        if (!enabled) {
+            statusClass = 'disconnected';
+            statusText = 'Disabled';
+        } else if (connected) {
+            statusClass = 'connected';
+            statusText = 'Connected';
+        } else {
+            statusClass = 'disconnected';
+            statusText = 'Waiting';
+        }
         const port = info.port != null ? '/dev/rfcomm' + info.port : '(none)';
-        return '<tr>' +
+        const ch = info.listen_channel != null ? ('ch ' + info.listen_channel) : '--';
+        const rowCls = enabled ? '' : ' class="opacity-50"';
+        return '<tr' + rowCls + '>' +
             '<td><span class="status-dot ' + statusClass + '"></span>' + statusText + '</td>' +
             '<td>' + escapeHtml(info.name) + '</td>' +
             '<td class="font-monospace">' + escapeHtml(addr) + '</td>' +
+            '<td class="font-monospace">' + escapeHtml(ch) + '</td>' +
             '<td class="font-monospace">' + escapeHtml(port) + '</td>' +
             '</tr>';
     }).join('');

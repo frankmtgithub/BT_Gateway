@@ -243,6 +243,8 @@ class MessageRouter:
                 "connected": addr in connected_addrs,
                 "address": addr,
                 "port": info.get("port"),
+                "enabled": bool(info.get("enabled", True)),
+                "listen_channel": int(info.get("listen_channel", 1) or 1),
             }
 
         return {
