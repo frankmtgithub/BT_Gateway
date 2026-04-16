@@ -291,19 +291,33 @@ def api_pair_device():
         current_app.device_server.begin_pair_guard(90)
         success = current_app.bt_manager.pair_device(address, adapter_name)
         if success:
-            # Do NOT disconnect HID or force SPP here.  Scanners ship in
-            # HID (keyboard) mode and the operator flow is:
-            #   1. Pair — scanner stays connected as a keyboard.
-            #   2. Scan the vendor "switch to SPP" barcode on the
-            #      scanner while it's still connected in HID.
-            #   3. The scanner reboots its BT stack, flips to SPP, and
-            #      initiates RFCOMM back into our listener on its
-            #      configured channel.
-            # Tearing down HID right after pair breaks step 2 — the
-            # scanner sees the link go down before the operator can
-            # scan the mode-switch barcode.  HID gets dropped later,
-            # in _on_new_connection, only once the scanner has actually
-            # chosen SPP.
+            # What BlueZ thinks this scanner supports.  Logged as a
+            # diagnostic because "br-connection-profile-unavailable"
+            # errors almost always mean the scanner is in HID-only mode
+            # on a Pi whose BlueZ has no HID (input) plugin enabled —
+            # i.e. there's literally no profile handler on this host
+            # that can keep the scanner's link alive.
+            uuids = []
+            try:
+                uuids = current_app.bt_manager.get_device_uuids(
+                    address, adapter_name
+                ) or []
+            except Exception:
+                pass
+            has_spp = SPP_UUID.lower() in uuids
+            has_hid = HID_UUID.lower() in uuids
+            clog = getattr(current_app, "conn_log", None)
+            if clog:
+                clog.log(
+                    "pair.uuids",
+                    f"{address} advertises {len(uuids)} UUID(s): "
+                    f"SPP={'yes' if has_spp else 'no'}, "
+                    f"HID={'yes' if has_hid else 'no'}. "
+                    f"Raw: {', '.join(uuids) if uuids else '(none)'}",
+                    level="info",
+                    address=address,
+                )
+
             entry = current_app.gateway_config.add_device(address)
             name = entry["name"] if isinstance(entry, dict) else entry
             port = entry["port"] if isinstance(entry, dict) else None
@@ -311,21 +325,48 @@ def api_pair_device():
             # channel so the scanner lands on the same /dev/rfcomm<N>
             # every time it flips to SPP mode.
             current_app.device_server.refresh_profiles()
-            # Some scanners drop the BT radio immediately after Pair()
-            # completes and go back to sleep.  Kick Device1.Connect and
-            # keep it alive so the operator has a live HID link to scan
-            # the "switch to SPP" barcode on.  start_handover is
-            # idempotent — if the scanner has already vanished, the
-            # keepalive thread will retry for 90 s and then give up.
-            try:
-                current_app.device_server.start_handover(address)
-            except Exception:
-                pass
+
+            hint = None
+            if has_spp:
+                # Scanner is already in SPP mode — the BT radio is
+                # still briefly awake right after Pair() completes, so
+                # nudge it onto our SPP listener immediately instead
+                # of letting it sleep and rely on auto-reconnect.
+                current_app.bt_manager.connect_profile(
+                    address, SPP_UUID, adapter_name
+                )
+                hint = ("Scanner already advertises SPP; the gateway "
+                        "is connecting to it now.")
+            else:
+                # No SPP.  We cannot keep the scanner awake in HID mode
+                # on this Pi (BlueZ has no input plugin to consume
+                # HID), so trying Device1.Connect() just spams the log
+                # with br-connection-profile-unavailable.  Guide the
+                # operator instead:
+                if clog:
+                    clog.log(
+                        "pair.hid_only",
+                        f"{address} advertises HID but not SPP. This Pi "
+                        "cannot hold a scanner connected as a keyboard "
+                        "(no BlueZ input plugin). Scan the vendor "
+                        "'switch to SPP' setup barcode on the scanner "
+                        "BEFORE pairing (or right now while it's still "
+                        "briefly awake), then re-pair. Once the scanner "
+                        "advertises SPP it will auto-connect here.",
+                        level="warn",
+                        address=address,
+                    )
+                hint = ("Scanner is in HID-only mode. Scan the vendor "
+                        "'switch to SPP' barcode on the scanner now "
+                        "(it's briefly awake) and re-pair if needed.")
             return jsonify({
                 "status": "paired", "name": name, "port": port,
                 "adapter": adapter_name,
                 "enabled": entry.get("enabled", True) if isinstance(entry, dict) else True,
                 "listen_channel": entry.get("listen_channel", 1) if isinstance(entry, dict) else 1,
+                "advertises_spp": has_spp,
+                "advertises_hid": has_hid,
+                "hint": hint,
             })
         return jsonify({"error": "Pairing failed"}), 500
     finally:

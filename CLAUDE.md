@@ -131,6 +131,47 @@ flow (`start_handover` / "Prepare for SPP mode" button) is
 unchanged — still available for troubleshooting scanners that
 won't come up on their own.
 
+## Session 2026-04-16 (later) — the HID keepalive can't work on this Pi
+
+User reported scanners still dropping the HID link right after
+`Pair()`.  The log shows the scanner's UUID list is populated but
+`Device1.Connect` fails every time with
+`org.bluez.Error.NotAvailable: br-connection-profile-unavailable`,
+which is BlueZ's way of saying "I opened the ACL but none of my
+loaded profile plugins match any UUID on the remote, so I have
+nowhere to put this connection".
+
+Root cause: on this Raspberry Pi, BlueZ is running without the
+**input** (HID) plugin loaded.  Without that plugin, BlueZ has no
+HID host and cannot keep a scanner that's paired in keyboard mode
+awake — the scanner's BT radio sleeps within seconds of `Pair()`
+completing because nothing on the Pi is subscribing to its HID
+reports.  `start_handover` (calling `Device1.Connect()` on a loop)
+can't fix that: every call fails with the same error.
+
+Implications for the app:
+
+* **Don't call `start_handover` automatically after pair.**  It
+  just loudly fails for 90 s and gives the operator misleading
+  "keepalive tick N: ACL down" entries.  Call it manually from
+  the Pairing page only when the user really wants to try.
+* **Expose the scanner's UUIDs in the connection log after pair.**
+  `pair.uuids` step prints the full list so the user can see
+  whether SPP is already advertised.  If SPP is there we kick
+  `ConnectProfile(SPP)` immediately (the scanner is briefly awake
+  right after `Pair()`).  If only HID is there, we warn the user
+  that on this Pi the scanner needs to be switched to SPP mode
+  first (scan the vendor setup barcode before re-pairing).
+* **Operator-facing flow that actually works on this Pi**: power
+  on the scanner, scan the vendor "switch to SPP" setup barcode
+  while unpaired (no host needed — it's a firmware command),
+  power-cycle the scanner, then pair.  The scanner will now
+  advertise SPP directly, `Device1.Connect` will bring it up via
+  our SPP profile, and the auto-connect loop will keep it alive.
+* **Alternative if the user really wants HID-first onboarding**:
+  enable BlueZ's `input` plugin in `/etc/bluetooth/main.conf`
+  (out of scope for this app — system-level change).
+
 ## Repo pointers
 
 * Entry point: `run.py`
