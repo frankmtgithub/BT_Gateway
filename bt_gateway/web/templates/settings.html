@@ -108,6 +108,40 @@
                     <input type="number" class="form-control" id="plc-reconnect-input"
                            value="5" min="1" max="300">
                 </div>
+                <hr>
+                <h6 class="mb-2"><i class="bi bi-heart-pulse"></i> PLC Keep-Alive</h6>
+                <p class="text-muted small mb-2">
+                    Periodically send a message to the PLC while connected so
+                    the remote end knows the link is alive.  A newline is
+                    appended automatically, just like any other PLC message.
+                </p>
+                <div class="form-check form-switch mb-2">
+                    <input class="form-check-input" type="checkbox"
+                           id="plc-keepalive-enabled">
+                    <label class="form-check-label" for="plc-keepalive-enabled">
+                        Enable keep-alive
+                    </label>
+                </div>
+                <div class="mb-3">
+                    <label for="plc-keepalive-interval-input" class="form-label">
+                        Interval (seconds)
+                    </label>
+                    <input type="number" class="form-control"
+                           id="plc-keepalive-interval-input"
+                           min="1" max="3600" value="30">
+                </div>
+                <div class="mb-3">
+                    <label for="plc-keepalive-message-input" class="form-label">
+                        Message
+                    </label>
+                    <input type="text" class="form-control"
+                           id="plc-keepalive-message-input"
+                           maxlength="256" value="PING">
+                    <small class="text-muted">
+                        Sent verbatim with a trailing newline.  Leave blank
+                        to disable.
+                    </small>
+                </div>
             </div>
         </div>
     </div>
@@ -321,6 +355,13 @@ function loadSettings() {
                 Number.isFinite(cfg.plc_channel) ? cfg.plc_channel : 0;
             document.getElementById('plc-com-port-input').value = cfg.plc_com_port || '';
             document.getElementById('plc-reconnect-input').value = cfg.plc_reconnect_interval || 5;
+            document.getElementById('plc-keepalive-enabled').checked =
+                !!cfg.plc_keepalive_enabled;
+            document.getElementById('plc-keepalive-interval-input').value =
+                Number.isFinite(cfg.plc_keepalive_interval) && cfg.plc_keepalive_interval > 0
+                    ? cfg.plc_keepalive_interval : 30;
+            document.getElementById('plc-keepalive-message-input').value =
+                cfg.plc_keepalive_message != null ? cfg.plc_keepalive_message : 'PING';
 
             // Fill the PLC COM port selector with available ports + the current one
             fetch('/api/ports/available')
@@ -383,6 +424,8 @@ function escAttr(s) {
 function saveSettings() {
     const channelOverrideRaw = document.getElementById('plc-channel-input').value;
     const channelOverride = parseInt(channelOverrideRaw);
+    const keepaliveInterval = parseInt(
+        document.getElementById('plc-keepalive-interval-input').value);
     const data = {
         plc_adapter: document.getElementById('plc-adapter-select').value,
         device_adapter: document.getElementById('device-adapter-select').value,
@@ -393,6 +436,13 @@ function saveSettings() {
         plc_com_port: document.getElementById('plc-com-port-input').value.trim(),
         plc_port: parseInt(document.getElementById('plc-port-input').value),
         plc_reconnect_interval: parseInt(document.getElementById('plc-reconnect-input').value) || 5,
+        plc_keepalive_enabled:
+            document.getElementById('plc-keepalive-enabled').checked,
+        plc_keepalive_interval:
+            Number.isFinite(keepaliveInterval) && keepaliveInterval > 0
+                ? keepaliveInterval : 30,
+        plc_keepalive_message:
+            document.getElementById('plc-keepalive-message-input').value,
     };
 
     if (data.plc_adapter && data.device_adapter && data.plc_adapter === data.device_adapter) {

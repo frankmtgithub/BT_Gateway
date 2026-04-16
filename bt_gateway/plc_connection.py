@@ -257,9 +257,15 @@ class PLCConnection:
         channel down (for example, Hercules closing the COM port on
         Windows), we actually notice and mark the connection disconnected,
         instead of blocking forever in recv().
+
+        Also drives the configurable keep-alive: when enabled, every
+        ``plc_keepalive_interval`` seconds we write
+        ``plc_keepalive_message + "\\n"`` to the PLC so the remote end
+        sees that we're still there even during long idle periods.
         """
         buffer = ""
         last_rx = time.monotonic()
+        last_keepalive = time.monotonic()
         while self._running and self._sock:
             try:
                 data = self._sock.recv(RECV_BUFFER)
@@ -286,10 +292,43 @@ class PLCConnection:
                         )
                         break
                     last_rx = time.monotonic()
+                # Fire the configurable keep-alive if it's due.  Pulling
+                # the settings each tick means edits from the Settings UI
+                # take effect without reconnecting.
+                if self._maybe_send_keepalive(last_keepalive):
+                    last_keepalive = time.monotonic()
                 continue
             except OSError as e:
                 logger.error("PLC read error: %s", e)
                 break
+
+    def _maybe_send_keepalive(self, last_keepalive):
+        """Send the configured keep-alive if it's due.
+
+        Returns True if a keep-alive was sent (caller should reset its
+        ``last_keepalive`` timer).  Returns False otherwise — including
+        when the feature is disabled or misconfigured.
+        """
+        enabled = bool(self._config.get("plc_keepalive_enabled", False))
+        if not enabled:
+            return False
+        try:
+            interval = int(self._config.get("plc_keepalive_interval", 0) or 0)
+        except (TypeError, ValueError):
+            interval = 0
+        if interval <= 0:
+            return False
+        message = self._config.get("plc_keepalive_message", "") or ""
+        if not message:
+            return False
+        if time.monotonic() - last_keepalive < interval:
+            return False
+        try:
+            self.send(message)
+        except Exception:
+            logger.exception("PLC keep-alive send failed")
+            return False
+        return True
 
     def _probe_link_alive(self):
         """Check whether the PLC socket is still usable.

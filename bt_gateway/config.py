@@ -34,6 +34,14 @@ DEFAULT_CONFIG = {
     "plc_com_port": "",
     "plc_port": 0,
     "plc_reconnect_interval": 5,
+    # Keep-alive message periodically sent to the PLC while connected.
+    # ``plc_keepalive_interval`` is in seconds; 0 disables the keep-alive.
+    # ``plc_keepalive_message`` is the literal payload (a newline is appended
+    # by the sender, same as normal PLC messages).  Empty message also
+    # disables it.
+    "plc_keepalive_enabled": False,
+    "plc_keepalive_interval": 30,
+    "plc_keepalive_message": "PING",
     "web_host": "0.0.0.0",
     "web_port": 8080,
     "debug_mode": False,

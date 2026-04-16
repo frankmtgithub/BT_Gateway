@@ -476,6 +476,9 @@ def api_settings_get():
         "plc_com_port": cfg.get("plc_com_port", ""),
         "plc_port": cfg.get("plc_port", 0),
         "plc_reconnect_interval": cfg.get("plc_reconnect_interval", 5),
+        "plc_keepalive_enabled": bool(cfg.get("plc_keepalive_enabled", False)),
+        "plc_keepalive_interval": int(cfg.get("plc_keepalive_interval", 30) or 0),
+        "plc_keepalive_message": cfg.get("plc_keepalive_message", ""),
         "web_port": cfg.get("web_port", 8080),
         "debug_mode": bool(cfg.get("debug_mode", False)),
     })
@@ -489,11 +492,14 @@ def api_settings_update():
     allowed = [
         "plc_adapter", "device_adapter",
         "plc_channel", "plc_com_port", "plc_port", "plc_reconnect_interval",
+        "plc_keepalive_enabled", "plc_keepalive_interval",
+        "plc_keepalive_message",
     ]
     for key in allowed:
         if key in data:
             value = data[key]
-            if key in ("plc_channel", "plc_port", "plc_reconnect_interval"):
+            if key in ("plc_channel", "plc_port", "plc_reconnect_interval",
+                       "plc_keepalive_interval"):
                 try:
                     value = int(value)
                 except (TypeError, ValueError):
@@ -501,6 +507,10 @@ def api_settings_update():
             elif key == "plc_com_port":
                 # Accept either "COM6" or "6" — store as a short label.
                 value = str(value or "").strip()
+            elif key == "plc_keepalive_message":
+                value = str(value or "")
+            elif key == "plc_keepalive_enabled":
+                value = bool(value)
             cfg.set(key, value)
 
     return jsonify({"status": "saved"})
