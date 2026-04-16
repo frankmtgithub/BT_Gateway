@@ -194,7 +194,44 @@ def api_pairing_disable():
     if adapter_name:
         current_app.bt_manager.stop_discovery(adapter_name)
     current_app.device_server.set_pairing_mode(False, adapter_name=adapter_name)
-    return jsonify({"status": "pairing_disabled", "adapter": adapter_name})
+    # Purge any discovered-but-not-paired entries from BlueZ so they
+    # don't clutter the UI (or BlueZ's cache) once the user is done
+    # pairing.  Paired devices stay.
+    purged = _purge_unpaired(adapter_name)
+    return jsonify({
+        "status": "pairing_disabled",
+        "adapter": adapter_name,
+        "purged": purged,
+    })
+
+
+def _purge_unpaired(adapter_name):
+    """Ask BlueZ to forget every non-paired device on ``adapter_name``.
+
+    Returns the count of addresses removed.  Failures on individual
+    entries are swallowed — a stale record that refuses to go is not
+    worth failing the whole "pairing off" request over.
+    """
+    if not adapter_name:
+        return 0
+    bt = current_app.bt_manager
+    try:
+        devices = bt.list_devices(adapter_name)
+    except Exception:
+        return 0
+    removed = 0
+    for dev in devices:
+        if dev.get("paired"):
+            continue
+        addr = dev.get("address") or ""
+        if not addr:
+            continue
+        try:
+            if bt.remove_device(addr, adapter_name=adapter_name):
+                removed += 1
+        except Exception:
+            pass
+    return removed
 
 
 @bp.route("/api/pairing/devices")

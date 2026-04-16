@@ -591,6 +591,8 @@ function disableDevPairing() {
   fetch('/api/pairing/disable', {method: 'POST'}).then(() => {
     const b = document.getElementById('wiz-dev-badge');
     b.textContent = 'OFF'; b.className = 'badge bg-secondary fs-6 align-self-center';
+    // Server purged unpaired discovery records; refresh the list.
+    refreshDevDiscovered();
   });
 }
 

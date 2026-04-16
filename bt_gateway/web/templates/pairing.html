@@ -342,6 +342,9 @@ document.addEventListener('DOMContentLoaded', function() {
             .then(() => {
                 document.getElementById('pairing-status-badge').textContent = 'OFF';
                 document.getElementById('pairing-status-badge').className = 'badge bg-secondary fs-6';
+                // Server just purged every non-paired discovery record;
+                // pull a fresh list so the UI stops showing ghosts.
+                refreshDiscovered();
             });
     });
 
