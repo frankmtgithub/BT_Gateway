@@ -55,6 +55,29 @@ def api_status():
     return jsonify(current_app.router.get_status())
 
 
+# ── Message log backfill ────────────────────────────────────────────────────
+
+@bp.route("/api/message-log")
+def api_message_log():
+    """Snapshot of the server-side message + debug ring buffers.
+
+    The dashboard fetches this on load so entries that accumulated while
+    the user was on another page (or before they connected) are replayed
+    into the UI in chronological order.
+    """
+    router = current_app.router
+    return jsonify({
+        "messages": router.get_message_log(),
+        "debug": router.get_debug_log(),
+    })
+
+
+@bp.route("/api/message-log/clear", methods=["POST"])
+def api_message_log_clear():
+    n = current_app.router.clear_logs()
+    return jsonify({"status": "cleared", "discarded": n})
+
+
 # ── Adapter API ──────────────────────────────────────────────────────────────
 
 @bp.route("/api/adapters")

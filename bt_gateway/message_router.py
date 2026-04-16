@@ -20,11 +20,17 @@ received message in real time.  Two channels are emitted:
       scanners / PLCs that send odd line terminators or binary bursts.
 """
 
+import collections
+import datetime
 import json
 import logging
 import threading
 
 logger = logging.getLogger(__name__)
+
+# Ring buffer size for the message / debug logs.  Matches the client-side
+# 500-entry cap in app.js so a full dashboard refresh never drops entries.
+LOG_BUFFER_CAPACITY = 500
 
 
 class MessageRouter:
@@ -36,6 +42,13 @@ class MessageRouter:
         self._plc_connection = None
         self._device_connections = {}  # address -> DeviceConnection
         self._lock = threading.Lock()
+        # Ring buffers so the dashboard can backfill the Message Log when
+        # it is opened (or reopened) after the gateway has been running.
+        # Without this, switching away from the Dashboard and back loses
+        # every entry that arrived while another page was active.
+        self._msg_log = collections.deque(maxlen=LOG_BUFFER_CAPACITY)
+        self._debug_log = collections.deque(maxlen=LOG_BUFFER_CAPACITY)
+        self._log_lock = threading.Lock()
 
     def set_plc_connection(self, plc_conn):
         self._plc_connection = plc_conn
@@ -197,26 +210,53 @@ class MessageRouter:
 
     def _emit_message_log(self, direction, device_name, device_address,
                           message, delivered=True, error=None):
-        if not self._socketio:
-            return
-        self._socketio.emit("message_log", {
+        entry = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "direction": direction,
             "device": device_name,
             "address": device_address,
             "message": message,
             "delivered": delivered,
             "error": error,
-        }, namespace="/")
+        }
+        with self._log_lock:
+            self._msg_log.append(entry)
+        if self._socketio:
+            self._socketio.emit("message_log", entry, namespace="/")
 
     def _emit_debug_log(self, source, name, address, raw_chunk):
-        if not self._socketio:
-            return
-        self._socketio.emit("debug_log", {
+        entry = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "source": source,        # "device" or "plc"
             "name": name,            # connection name or "PLC"
             "address": address,      # BT MAC address of the source
             "raw": raw_chunk,
-        }, namespace="/")
+        }
+        with self._log_lock:
+            self._debug_log.append(entry)
+        if self._socketio:
+            self._socketio.emit("debug_log", entry, namespace="/")
+
+    # ── Ring-buffer access (used by the dashboard to backfill) ─────────
+
+    def get_message_log(self):
+        """Snapshot of recent routed-message entries."""
+        with self._log_lock:
+            return list(self._msg_log)
+
+    def get_debug_log(self):
+        """Snapshot of recent raw-chunk debug entries."""
+        with self._log_lock:
+            return list(self._debug_log)
+
+    def clear_logs(self):
+        """Drop both ring buffers (called by the UI's Clear button)."""
+        with self._log_lock:
+            msg_n = len(self._msg_log)
+            dbg_n = len(self._debug_log)
+            self._msg_log.clear()
+            self._debug_log.clear()
+        return msg_n + dbg_n
 
     # ── Status snapshot ────────────────────────────────────────────────
 

@@ -8,6 +8,18 @@ const socket = io();
 // filter dropdown on the dashboard.
 const knownConnections = new Set();
 
+// Ring of recent message + debug entries.  Kept regardless of which page
+// the user is currently on so the Dashboard can backfill when it mounts.
+// The server also keeps a copy, but a local buffer avoids a round-trip on
+// every page navigation and survives short disconnects of Socket.IO.
+const LOG_BUFFER_CAPACITY = 500;
+const messageLogBuffer = [];
+const debugLogBuffer = [];
+function pushToBuffer(buf, entry) {
+    buf.push(entry);
+    if (buf.length > LOG_BUFFER_CAPACITY) buf.shift();
+}
+
 // ── Socket.IO event handlers ────────────────────────────────────────────────
 
 socket.on('connect', function() {
@@ -47,10 +59,12 @@ socket.on('device_disconnected', function(data) {
 });
 
 socket.on('message_log', function(data) {
+    pushToBuffer(messageLogBuffer, data);
     addLogEntry(data);
 });
 
 socket.on('debug_log', function(data) {
+    pushToBuffer(debugLogBuffer, data);
     addDebugEntry(data);
 });
 
@@ -173,6 +187,33 @@ function updateDeviceCount(count) {
     if (el) el.textContent = count;
 }
 
+// ── Backfill on dashboard mount ─────────────────────────────────────────────
+
+function backfillMessageLog() {
+    fetch('/api/message-log')
+        .then(r => r.json())
+        .then(data => {
+            const msgs = Array.isArray(data.messages) ? data.messages : [];
+            const dbg = Array.isArray(data.debug) ? data.debug : [];
+            // Merge into the local buffers, keeping capacity and order.
+            // The server buffer is authoritative for anything we missed
+            // while Socket.IO was offline, so replace outright.
+            messageLogBuffer.length = 0;
+            dbg.forEach(e => debugLogBuffer.push(e));
+            msgs.forEach(e => messageLogBuffer.push(e));
+            while (messageLogBuffer.length > LOG_BUFFER_CAPACITY)
+                messageLogBuffer.shift();
+            while (debugLogBuffer.length > LOG_BUFFER_CAPACITY)
+                debugLogBuffer.shift();
+            // Render everything in one pass.
+            const log = document.getElementById('message-log');
+            if (log) log.innerHTML = '';
+            msgs.forEach(e => addLogEntry(e));
+            dbg.forEach(e => addDebugEntry(e));
+        })
+        .catch(err => console.error('Message-log backfill failed:', err));
+}
+
 // ── Message log ─────────────────────────────────────────────────────────────
 
 function refreshLogFilter() {
@@ -233,8 +274,11 @@ function addLogEntry(data) {
         label = device;
     }
 
-    const now = new Date();
-    const time = now.toLocaleTimeString();
+    // Prefer the server-supplied timestamp when available (backfill
+    // entries carry one) so the rendered time matches when the event
+    // actually happened — not when the browser opened the dashboard.
+    const ts = data.ts ? new Date(data.ts) : new Date();
+    const time = isNaN(ts) ? new Date().toLocaleTimeString() : ts.toLocaleTimeString();
     const entry = document.createElement('div');
     entry.className = 'log-entry';
     let badge = '';
@@ -276,8 +320,8 @@ function addDebugEntry(data) {
     const filter = currentLogFilter();
     if (filter && filter !== name) return;
 
-    const now = new Date();
-    const time = now.toLocaleTimeString();
+    const ts = data.ts ? new Date(data.ts) : new Date();
+    const time = isNaN(ts) ? new Date().toLocaleTimeString() : ts.toLocaleTimeString();
     const entry = document.createElement('div');
     entry.className = 'log-entry debug';
     const label = 'DEBUG ' + (data.source === 'plc' ? 'PLC' : name) +

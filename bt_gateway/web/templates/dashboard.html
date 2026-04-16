@@ -110,12 +110,21 @@ document.addEventListener('DOMContentLoaded', function() {
     // Initial status load
     fetchStatus();
 
+    // Backfill the message log from the server ring buffer so entries
+    // that arrived while the user was on another page (or before their
+    // browser connected) are replayed in chronological order.
+    backfillMessageLog();
+
     // Periodic refresh
     setInterval(fetchStatus, 5000);
 
     document.getElementById('clear-log-btn').addEventListener('click', function() {
-        const log = document.getElementById('message-log');
-        log.innerHTML = '<div class="text-muted">Log cleared.</div>';
+        fetch('/api/message-log/clear', {method: 'POST'})
+            .catch(() => {})
+            .finally(() => {
+                const log = document.getElementById('message-log');
+                log.innerHTML = '<div class="text-muted">Log cleared.</div>';
+            });
     });
 
     // Debug-mode switch
