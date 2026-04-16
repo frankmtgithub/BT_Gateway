@@ -204,7 +204,17 @@ class BluetoothManager:
         return devices
 
     def pair_device(self, device_address, adapter_name=None):
-        """Initiate pairing with a device by its BT address."""
+        """Initiate pairing with a device by its BT address.
+
+        BlueZ's ``Device1.Pair`` is idempotent from the caller's side —
+        if a previous ``Pair()`` call is still in flight, a second call
+        raises ``org.bluez.Error.InProgress``.  We catch that and treat
+        it as a success precondition: the user clicked twice in a row
+        (or auto-connect raced the user), but the first attempt is
+        still progressing.  We also try ``CancelPairing`` + retry once
+        so the second click actually re-runs the flow if the first
+        attempt has wedged.
+        """
         self._clog("info", "pair.start",
                    f"Pairing {device_address} on {adapter_name or '(default)'}",
                    address=device_address)
@@ -215,27 +225,57 @@ class BluetoothManager:
                        f"Device {device_address} not present in BlueZ — "
                        "discovery still running?", address=device_address)
             return False
+        device = dbus.Interface(
+            self._bus.get_object(BLUEZ_SERVICE, device_path), DEVICE_IFACE
+        )
+        props = dbus.Interface(
+            self._bus.get_object(BLUEZ_SERVICE, device_path), PROPS_IFACE
+        )
+
+        # If BlueZ already says the device is paired, skip Pair() and
+        # just refresh Trusted so we don't nudge a fresh authentication.
         try:
-            device = dbus.Interface(
-                self._bus.get_object(BLUEZ_SERVICE, device_path), DEVICE_IFACE
-            )
-            device.Pair()
-            # Trust the device so it can reconnect without user confirmation
-            props = dbus.Interface(
-                self._bus.get_object(BLUEZ_SERVICE, device_path), PROPS_IFACE
-            )
-            props.Set(DEVICE_IFACE, "Trusted", dbus.Boolean(True))
-            logger.info("Paired and trusted device %s", device_address)
-            self._clog("info", "pair.ok",
-                       f"Paired and trusted {device_address}",
-                       address=device_address)
-            return True
-        except dbus.DBusException as e:
-            logger.error("Failed to pair with %s: %s", device_address, e)
-            self._clog("error", "pair.fail",
-                       f"BlueZ pair failed for {device_address}: {e}",
-                       address=device_address)
-            return False
+            if bool(props.Get(DEVICE_IFACE, "Paired")):
+                props.Set(DEVICE_IFACE, "Trusted", dbus.Boolean(True))
+                self._clog("info", "pair.already",
+                           f"{device_address} already paired; ensured Trusted",
+                           address=device_address)
+                return True
+        except dbus.DBusException:
+            pass
+
+        for attempt in (1, 2):
+            try:
+                device.Pair(timeout=60000)
+                props.Set(DEVICE_IFACE, "Trusted", dbus.Boolean(True))
+                logger.info("Paired and trusted device %s", device_address)
+                self._clog("info", "pair.ok",
+                           f"Paired and trusted {device_address}",
+                           address=device_address)
+                return True
+            except dbus.DBusException as e:
+                name = getattr(e, "get_dbus_name", lambda: "")() or ""
+                msg = str(e)
+                # Benign: a previous Pair() call is still running. Cancel
+                # it and retry once so the user's click actually takes
+                # effect instead of bumping into the stale attempt.
+                if "InProgress" in name or "InProgress" in msg:
+                    if attempt == 1:
+                        self._clog("warn", "pair.in_progress",
+                                   f"Previous Pair() still running on "
+                                   f"{device_address} — cancelling and retrying",
+                                   address=device_address)
+                        try:
+                            device.CancelPairing()
+                        except dbus.DBusException:
+                            pass
+                        continue
+                logger.error("Failed to pair with %s: %s", device_address, e)
+                self._clog("error", "pair.fail",
+                           f"BlueZ pair failed for {device_address}: {e}",
+                           address=device_address)
+                return False
+        return False
 
     def connect_device(self, device_address, adapter_name=None):
         """Bring the ACL link up via BlueZ ``Device1.Connect``.
@@ -339,12 +379,46 @@ class BluetoothManager:
                        address=device_address, uuid=str(uuid))
             return False
 
-    def disconnect_profile(self, device_address, uuid, adapter_name=None):
+    def disconnect_profile(self, device_address, uuid, adapter_name=None,
+                           only_if_connected=True, only_if_advertised=True):
         """Disconnect a specific profile on a device (e.g. HID) without
-        touching other connected profiles."""
+        touching other connected profiles.
+
+        By default we skip the BlueZ call entirely when either
+
+        * the device isn't currently connected (there is nothing to
+          disconnect), or
+        * the profile UUID isn't in the device's advertised UUID list
+          (BlueZ will reject with ``InvalidArguments`` anyway).
+
+        Both gates avoid hammering BlueZ with calls that are guaranteed
+        to fail and fill the connection log with noise — especially from
+        the auto-connect loop and PLC reconnect loop, which previously
+        iterated over every non-SPP UUID regardless of whether the
+        remote actually spoke them.
+        """
         device_path = self._find_device_path(device_address, adapter_name)
         if not device_path:
             return False
+
+        if only_if_connected and not self.is_device_connected(
+            device_address, adapter_name
+        ):
+            self._clog("debug", "profile.disconnect.skip",
+                       f"Skip DisconnectProfile({_uuid_label(uuid)}) — "
+                       f"{device_address} is not currently connected",
+                       address=device_address, uuid=str(uuid))
+            return False
+
+        if only_if_advertised:
+            advertised = self.get_device_uuids(device_address, adapter_name)
+            if str(uuid).lower() not in advertised:
+                self._clog("debug", "profile.disconnect.skip",
+                           f"Skip DisconnectProfile({_uuid_label(uuid)}) — "
+                           f"{device_address} does not advertise this profile",
+                           address=device_address, uuid=str(uuid))
+                return False
+
         try:
             device = dbus.Interface(
                 self._bus.get_object(BLUEZ_SERVICE, device_path), DEVICE_IFACE

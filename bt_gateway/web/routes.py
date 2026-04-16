@@ -17,6 +17,14 @@ bp = Blueprint("gateway", __name__)
 SPP_UUID = "00001101-0000-1000-8000-00805f9b34fb"
 HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
 
+# Guard against duplicate pair attempts for the same address from rapid
+# UI re-clicks.  Each entry is the uppercase MAC of a pair that is
+# currently running.  BlueZ itself returns InProgress for concurrent
+# Pair() calls, but failing fast here avoids an additional 25s D-Bus
+# timeout on the duplicate request.
+_PAIR_IN_FLIGHT = set()
+_PAIR_IN_FLIGHT_LOCK = threading.Lock()
+
 
 # ── Page routes ──────────────────────────────────────────────────────────────
 
@@ -157,39 +165,57 @@ def api_pairing_devices():
 @bp.route("/api/pairing/pair", methods=["POST"])
 def api_pair_device():
     data = request.get_json() or {}
-    address = data.get("address", "")
+    address = (data.get("address") or "").strip().upper()
     if not address:
         return jsonify({"error": "No address provided"}), 400
 
     # Block: this device is already bound to the PLC adapter.  Pairing it
     # here too would leave BlueZ with split-ownership confusion on the same
     # physical device; force the user to unpair it from the PLC first.
-    if address.upper() == _plc_paired_address():
+    if address == _plc_paired_address():
         return jsonify({
             "error": "This device is paired on the PLC adapter. "
                      "Unpair it from the PLC side first if you want to use "
                      "it as a device."
         }), 409
 
+    # Reject duplicate in-flight pair attempts on the same address — a
+    # BlueZ Pair() call can take up to a minute, so rapid UI re-clicks
+    # used to queue up and fail with InProgress / NoReply.
+    with _PAIR_IN_FLIGHT_LOCK:
+        if address in _PAIR_IN_FLIGHT:
+            return jsonify({
+                "error": "A pair attempt for this device is already in "
+                         "progress — please wait for it to finish."
+            }), 409
+        _PAIR_IN_FLIGHT.add(address)
+
     adapter_name = _resolve_pairing_adapter(data)
-    success = current_app.bt_manager.pair_device(address, adapter_name)
-    if success:
-        # Force SPP, kill HID so barcode scanners don't act as keyboards
-        current_app.bt_manager.disconnect_profile(address, HID_UUID, adapter_name)
-        current_app.bt_manager.connect_profile(address, SPP_UUID, adapter_name)
-        entry = current_app.gateway_config.add_device(address)
-        name = entry["name"] if isinstance(entry, dict) else entry
-        port = entry["port"] if isinstance(entry, dict) else None
-        # Bring up the SPP listener now so the scanner can initiate its
-        # side of the connection as soon as it switches to SPP mode.
-        current_app.device_server.refresh_profiles()
-        return jsonify({
-            "status": "paired", "name": name, "port": port,
-            "adapter": adapter_name,
-            "enabled": entry.get("enabled", True) if isinstance(entry, dict) else True,
-            "listen_channel": entry.get("listen_channel", 1) if isinstance(entry, dict) else 1,
-        })
-    return jsonify({"error": "Pairing failed"}), 500
+    try:
+        # Pause the auto-connect loop so BlueZ has exclusive D-Bus
+        # attention while Pair() runs.
+        current_app.device_server.begin_pair_guard(90)
+        success = current_app.bt_manager.pair_device(address, adapter_name)
+        if success:
+            # Force SPP, kill HID so barcode scanners don't act as keyboards
+            current_app.bt_manager.disconnect_profile(address, HID_UUID, adapter_name)
+            current_app.bt_manager.connect_profile(address, SPP_UUID, adapter_name)
+            entry = current_app.gateway_config.add_device(address)
+            name = entry["name"] if isinstance(entry, dict) else entry
+            port = entry["port"] if isinstance(entry, dict) else None
+            # Bring up the SPP listener now so the scanner can initiate its
+            # side of the connection as soon as it switches to SPP mode.
+            current_app.device_server.refresh_profiles()
+            return jsonify({
+                "status": "paired", "name": name, "port": port,
+                "adapter": adapter_name,
+                "enabled": entry.get("enabled", True) if isinstance(entry, dict) else True,
+                "listen_channel": entry.get("listen_channel", 1) if isinstance(entry, dict) else 1,
+            })
+        return jsonify({"error": "Pairing failed"}), 500
+    finally:
+        with _PAIR_IN_FLIGHT_LOCK:
+            _PAIR_IN_FLIGHT.discard(address)
 
 
 @bp.route("/api/pairing/remove", methods=["POST"])
@@ -296,7 +322,7 @@ def api_plc_discovered():
 def api_plc_pair():
     """Pair the single PLC on the PLC adapter."""
     data = request.get_json() or {}
-    address = (data.get("address") or "").strip()
+    address = (data.get("address") or "").strip().upper()
     if not address:
         return jsonify({"error": "No address provided"}), 400
 
@@ -305,24 +331,41 @@ def api_plc_pair():
         return jsonify({"error": "No PLC adapter configured"}), 400
 
     existing = current_app.bt_manager.get_single_paired_device(adapter)
-    if existing and existing["address"].upper() != address.upper():
+    if existing and existing["address"].upper() != address:
         return jsonify({
             "error": f"A PLC ({existing['address']}) is already paired. "
                      "Unpair it first."
         }), 400
 
-    if not current_app.bt_manager.pair_device(address, adapter):
-        return jsonify({"error": "Pairing failed"}), 500
+    with _PAIR_IN_FLIGHT_LOCK:
+        if address in _PAIR_IN_FLIGHT:
+            return jsonify({
+                "error": "A pair attempt for this device is already in "
+                         "progress — please wait for it to finish."
+            }), 409
+        _PAIR_IN_FLIGHT.add(address)
 
-    # Force SPP — kill any audio/HID that BlueZ may have connected
-    for uuid in (HID_UUID,
-                 "0000110b-0000-1000-8000-00805f9b34fb",
-                 "0000110a-0000-1000-8000-00805f9b34fb",
-                 "0000111e-0000-1000-8000-00805f9b34fb",
-                 "00001108-0000-1000-8000-00805f9b34fb"):
-        current_app.bt_manager.disconnect_profile(address, uuid, adapter)
-    current_app.bt_manager.connect_profile(address, SPP_UUID, adapter)
-    current_app.bt_manager.stop_discovery(adapter)
+    try:
+        # Pause devices-side auto-connect while the PLC pair runs on the
+        # other adapter; the two adapters share the D-Bus daemon.
+        current_app.device_server.begin_pair_guard(90)
+        if not current_app.bt_manager.pair_device(address, adapter):
+            return jsonify({"error": "Pairing failed"}), 500
+
+        # Force SPP — kill any audio/HID that BlueZ may have connected.
+        # disconnect_profile is now skipped automatically when the device
+        # doesn't advertise the UUID, so this is no longer spammy.
+        for uuid in (HID_UUID,
+                     "0000110b-0000-1000-8000-00805f9b34fb",
+                     "0000110a-0000-1000-8000-00805f9b34fb",
+                     "0000111e-0000-1000-8000-00805f9b34fb",
+                     "00001108-0000-1000-8000-00805f9b34fb"):
+            current_app.bt_manager.disconnect_profile(address, uuid, adapter)
+        current_app.bt_manager.connect_profile(address, SPP_UUID, adapter)
+        current_app.bt_manager.stop_discovery(adapter)
+    finally:
+        with _PAIR_IN_FLIGHT_LOCK:
+            _PAIR_IN_FLIGHT.discard(address)
     # The device we just claimed for the PLC side may have been previously
     # paired on the devices adapter too.  Refresh SPP profile registrations
     # so that device no longer has an active listener.

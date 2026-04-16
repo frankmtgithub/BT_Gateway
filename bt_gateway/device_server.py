@@ -39,6 +39,17 @@ RECV_BUFFER = 4096
 # having to click anything.
 AUTO_CONNECT_INTERVAL = 10
 
+# Per-device exponential backoff after a failed ConnectProfile, so a
+# powered-off / out-of-range scanner doesn't get hammered every 10 s
+# (each failed attempt blocks BlueZ for ~5 s on a page timeout, which is
+# what starves concurrent pair/discovery calls).
+AUTO_CONNECT_BACKOFF = [30, 60, 120, 240, 480, 600]
+
+# While the user is pairing (or has just paired), stop touching BlueZ
+# on other devices so the pair flow has exclusive D-Bus access.  This
+# default can be overridden per-call.
+DEFAULT_PAIR_GUARD_SECONDS = 90.0
+
 
 class DeviceConnection:
     """Wraps a single RFCOMM connection to a remote device."""
@@ -236,6 +247,19 @@ class DeviceServer:
         # the handover keepalive thread for that device.
         self._handover_stops = {}
         self._handover_threads = {}
+        # Pair guard — while active, the auto-connect loop leaves every
+        # device alone so the user's pair attempt has exclusive D-Bus
+        # access (otherwise auto-connect's 5s page-timeouts cause Pair
+        # to return NoReply / AuthenticationTimeout).  Value is the
+        # monotonic deadline until which the guard is active.
+        self._pair_guard_until = 0.0
+        # Per-address next-allowed monotonic time for auto-connect
+        # ConnectProfile attempts.  Populated by exponential backoff on
+        # failure; cleared on a successful accept.
+        self._auto_connect_next = {}
+        # How many consecutive failures each address has — drives the
+        # AUTO_CONNECT_BACKOFF index.
+        self._auto_connect_fails = {}
 
     def _clog(self, level, step, detail, **kw):
         if self._conn_log is None:
@@ -419,6 +443,11 @@ class DeviceServer:
         # this device — we got what we were waiting for.
         self._stop_handover_unlocked(address, reason="spp.connected")
 
+        # Clear auto-connect backoff state: this scanner is clearly alive.
+        with self._lock:
+            self._auto_connect_next.pop(address, None)
+            self._auto_connect_fails.pop(address, None)
+
         # HID scanners announce both SPP and HID.  BlueZ will usually bring
         # up both, meaning scan events are sent to the OS as keystrokes
         # (which is why scanning opens a browser URL).  Disconnect HID so
@@ -549,10 +578,19 @@ class DeviceServer:
         if not adapter_name:
             return
 
-        # Snapshot the connected set under lock, then work outside it.
+        # If the user is mid-pair (or just paired), keep BlueZ idle so the
+        # pair D-Bus call doesn't queue behind our 5s page-timeouts.
+        now = time.monotonic()
+        if self._pairing_mode or now < self._pair_guard_until:
+            self._clog("debug", "auto.skip",
+                       "Auto-connect skipped (pair guard active)")
+            return
+
+        # Snapshot state under lock; then work outside it.
         with self._lock:
             connected = set(self._connections.keys())
             in_handover = set(self._handover_stops.keys())
+            next_allowed = dict(self._auto_connect_next)
 
         for addr, dev in self._config.get_enabled_devices().items():
             if self._is_plc_paired_address(addr):
@@ -561,20 +599,71 @@ class DeviceServer:
                 # Already happily streaming — just keep HID off in case
                 # BlueZ opportunistically reopened it in the background.
                 self._bt_manager.disconnect_profile(addr, HID_UUID, adapter_name)
+                # Healthy link clears any residual backoff.
+                with self._lock:
+                    self._auto_connect_next.pop(addr, None)
+                    self._auto_connect_fails.pop(addr, None)
                 continue
             if addr in in_handover:
                 # A dedicated thread is driving this device right now.
                 # Don't race it.
                 continue
-            # Try to bring SPP up.  Belt-and-suspenders: drop HID first so
-            # BlueZ doesn't "already-connected" us via the wrong profile.
+            # Respect per-device backoff: don't keep hammering an offline
+            # scanner with 5-second page-timeout blocks.
+            deadline = next_allowed.get(addr, 0.0)
+            if deadline and now < deadline:
+                continue
+
+            channel = int(dev.get("listen_channel") or 0) or None
             logger.debug("Auto-connect: attempting SPP on %s", addr)
             self._clog("debug", "auto.tick",
                        f"Auto-connect: dropping HID and asking for SPP on {addr}",
-                       address=addr,
-                       channel=int(dev.get("listen_channel") or 0) or None)
+                       address=addr, channel=channel)
+            # Drop HID only if it's actually up — avoids InvalidArguments
+            # on every tick when the scanner isn't connected.
             self._bt_manager.disconnect_profile(addr, HID_UUID, adapter_name)
-            self._bt_manager.connect_profile(addr, SPP_UUID, adapter_name)
+            ok = self._bt_manager.connect_profile(addr, SPP_UUID, adapter_name)
+            if ok:
+                with self._lock:
+                    self._auto_connect_next.pop(addr, None)
+                    self._auto_connect_fails.pop(addr, None)
+            else:
+                self._register_auto_connect_failure(addr, channel)
+
+    def _register_auto_connect_failure(self, address, channel=None):
+        """Bump the failure counter for ``address`` and push out its next
+        allowed attempt time using :data:`AUTO_CONNECT_BACKOFF`."""
+        with self._lock:
+            fails = self._auto_connect_fails.get(address, 0) + 1
+            self._auto_connect_fails[address] = fails
+            idx = min(fails - 1, len(AUTO_CONNECT_BACKOFF) - 1)
+            wait = AUTO_CONNECT_BACKOFF[idx]
+            self._auto_connect_next[address] = time.monotonic() + wait
+        self._clog("debug", "auto.backoff",
+                   f"ConnectProfile failed {fails}× for {address}; "
+                   f"next auto-connect attempt in {wait}s",
+                   address=address, channel=channel, fails=fails, wait=wait)
+
+    # ── Pair guard ─────────────────────────────────────────────────────
+
+    def begin_pair_guard(self, seconds=DEFAULT_PAIR_GUARD_SECONDS):
+        """Suspend auto-connect activity for a window so a user-initiated
+        pair has clean D-Bus access.  Idempotent — extending an active
+        guard just pushes the deadline out."""
+        deadline = time.monotonic() + max(1.0, float(seconds))
+        if deadline > self._pair_guard_until:
+            self._pair_guard_until = deadline
+            self._clog("info", "auto.pair_guard",
+                       f"Auto-connect paused for {int(seconds)}s "
+                       "while pairing runs")
+
+    def end_pair_guard(self):
+        """Clear the pair guard immediately (used by callers that know
+        the pair has finished)."""
+        if self._pair_guard_until:
+            self._pair_guard_until = 0.0
+            self._clog("info", "auto.pair_guard_off",
+                       "Auto-connect resumed (pair guard cleared)")
 
     # ── HID → SPP handover ─────────────────────────────────────────────
 
