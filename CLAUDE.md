@@ -172,11 +172,40 @@ Implications for the app:
   enable BlueZ's `input` plugin in `/etc/bluetooth/main.conf`
   (out of scope for this app — system-level change).
 
+## Session 2026-04-16 (cleanup) — drop the HID→SPP handover code
+
+The `start_handover` / `stop_handover` flow and its UI entry
+(`Prepare for SPP mode` button, handover modal) were removed
+entirely.  They can't work on this Pi — `Device1.Connect` fails
+with `br-connection-profile-unavailable` for HID-only scanners
+because BlueZ has no `input` plugin loaded — and keeping them
+around just confused operators.
+
+Also silenced the PLC reconnect loop in the **connection log**
+UI: `bt_manager.connect_profile` and `disconnect_profile` now
+accept a `silent=False` kwarg, and `plc_connection._prepare_plc_link`
+/ `_close_socket` pass `silent=True`.  The stdlib Python logger
+still records everything; the user-facing connection-log panel is
+back to being about scanner events only.
+
+Removed:
+
+* `DeviceServer.start_handover` / `stop_handover` /
+  `_stop_handover_unlocked` / `_handover_loop` /
+  `active_handovers` property.
+* `BtManager.connect_device` (only caller was the handover flow).
+* `/api/devices/<addr>/handover/start|stop` and
+  `/api/handover/active` routes.
+* Handover modal, `startHandover()` JS, and the "Prepare for SPP
+  mode" button in `pairing.html`.
+* Handover-related bookkeeping in `_auto_connect_tick` and
+  `accept_connection`.
+
 ## Repo pointers
 
 * Entry point: `run.py`
 * BT adapter layer: `bt_gateway/bt_manager.py`
-* SPP server + handover: `bt_gateway/device_server.py`
+* SPP server: `bt_gateway/device_server.py`
 * Connection log: `bt_gateway/connection_log.py`
 * PLC RFCOMM client: `bt_gateway/plc_connection.py`
 * Web UI: `bt_gateway/web/templates/pairing.html` (connection log

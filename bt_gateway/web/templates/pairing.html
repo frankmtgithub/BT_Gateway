@@ -184,51 +184,7 @@
             </div>
             <div class="card-footer small text-muted">
                 Every SPP pairing, HID/SPP profile switch, auto-connect tick
-                and rejection is logged here in real time.  Use <em>Prepare
-                for SPP mode</em> on a paired device to run the HID→SPP
-                handover and watch it land.
-            </div>
-        </div>
-    </div>
-</div>
-
-<!-- Handover helper modal -->
-<div class="modal fade" id="handoverModal" tabindex="-1">
-    <div class="modal-dialog">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h5 class="modal-title">
-                    <i class="bi bi-arrow-left-right"></i> HID → SPP handover
-                </h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-            </div>
-            <div class="modal-body">
-                <p>
-                    The gateway is holding the scanner active in HID mode and
-                    the SPP listener is armed on channel
-                    <strong id="handover-channel">?</strong> for device
-                    <strong id="handover-name">?</strong>.
-                </p>
-                <ol>
-                    <li>Make sure the scanner is <strong>powered on and in
-                        range</strong>.</li>
-                    <li>Scan the vendor <em>“Switch to Bluetooth SPP”</em>
-                        barcode now.</li>
-                    <li>Watch the Connection Log below — a
-                        <code>spp.accept</code> line means success.</li>
-                </ol>
-                <p class="text-muted small mb-0">
-                    The handover window stays open for 90&nbsp;seconds.
-                    You can cancel at any time.
-                </p>
-            </div>
-            <div class="modal-footer">
-                <button type="button" class="btn btn-outline-danger"
-                        id="handover-cancel-btn">
-                    <i class="bi bi-x-circle"></i> Cancel handover
-                </button>
-                <button type="button" class="btn btn-secondary"
-                        data-bs-dismiss="modal">Close</button>
+                and rejection is logged here in real time.
             </div>
         </div>
     </div>
@@ -566,11 +522,6 @@ function refreshPaired() {
                     </td>
                     <td class="font-monospace">${portCell}</td>
                     <td>
-                        <button class="btn btn-sm btn-outline-success me-1"
-                                onclick="startHandover('${addr}', '${escHtml(info.name)}', ${listenCh})"
-                                title="Hold HID up and arm SPP listener so you can scan the vendor 'switch to SPP' barcode">
-                            <i class="bi bi-arrow-left-right"></i> Prepare for SPP mode
-                        </button>
                         <button class="btn btn-sm btn-outline-primary me-1"
                                 onclick="openRename('${addr}', '${escHtml(info.name)}')"
                                 title="Rename">
@@ -678,17 +629,15 @@ function escAttr(s) {
     return String(s).replace(/&/g, '&amp;').replace(/'/g, '&#39;').replace(/"/g, '&quot;');
 }
 
-// ── Connection log & HID→SPP handover ───────────────────────────────────
+// ── Connection log ──────────────────────────────────────────────────────
 
 // Which addresses we've already offered as filter options so we don't
 // rebuild the <select> on every log event.
 const clogKnownAddresses = new Set();
-let clogActiveAddress = null;
 
 document.addEventListener('DOMContentLoaded', function() {
     const clearBtn = document.getElementById('clog-clear-btn');
     const filter = document.getElementById('clog-filter');
-    const handoverCancelBtn = document.getElementById('handover-cancel-btn');
 
     if (clearBtn) {
         clearBtn.addEventListener('click', function() {
@@ -707,21 +656,6 @@ document.addEventListener('DOMContentLoaded', function() {
         filter.addEventListener('change', function() {
             // Re-fetch the whole recent buffer so the view matches the filter.
             loadConnectionLog();
-        });
-    }
-
-    if (handoverCancelBtn) {
-        handoverCancelBtn.addEventListener('click', function() {
-            const addr = handoverCancelBtn.dataset.address || '';
-            if (!addr) return;
-            const urlAddr = addr.replace(/:/g, '-');
-            fetch('/api/devices/' + urlAddr + '/handover/stop', { method: 'POST' })
-                .then(r => r.json())
-                .then(() => {
-                    const m = bootstrap.Modal.getInstance(
-                        document.getElementById('handoverModal'));
-                    if (m) m.hide();
-                });
         });
     }
 
@@ -830,29 +764,5 @@ function refreshConnectionLogFilter() {
     if (previous) filter.value = previous;
 }
 
-function startHandover(address, name, channel) {
-    const urlAddr = address.replace(/:/g, '-');
-    fetch('/api/devices/' + urlAddr + '/handover/start', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({}),
-    }).then(r => r.json()).then(data => {
-        if (data.error) { alert(data.error); return; }
-        document.getElementById('handover-name').textContent = name;
-        document.getElementById('handover-channel').textContent = channel;
-        const btn = document.getElementById('handover-cancel-btn');
-        if (btn) btn.dataset.address = address;
-        // Focus the filter on this device so the log narrows in on it.
-        clogActiveAddress = address;
-        clogKnownAddresses.add(address);
-        refreshConnectionLogFilter();
-        const filter = document.getElementById('clog-filter');
-        if (filter) {
-            filter.value = address;
-            loadConnectionLog();
-        }
-        new bootstrap.Modal(document.getElementById('handoverModal')).show();
-    });
-}
 </script>
 {% endblock %}

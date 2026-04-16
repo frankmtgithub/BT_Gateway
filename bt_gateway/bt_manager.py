@@ -323,44 +323,6 @@ class BluetoothManager:
                 return False
         return False
 
-    def connect_device(self, device_address, adapter_name=None):
-        """Bring the ACL link up via BlueZ ``Device1.Connect``.
-
-        Unlike :meth:`connect_profile`, this tells BlueZ "connect every
-        profile you know how to".  For a scanner in HID mode that
-        brings up HID and keeps the ACL link alive — which is exactly
-        the state we need while the user scans the "switch to SPP"
-        barcode, because a mode change on a live ACL link reconnects
-        faster and more reliably than one on an idle link.
-        """
-        device_path = self._find_device_path(device_address, adapter_name)
-        if not device_path:
-            self._clog("error", "device.connect.not_found",
-                       f"Device {device_address} not in BlueZ",
-                       address=device_address)
-            return False
-        try:
-            device = dbus.Interface(
-                self._bus.get_object(BLUEZ_SERVICE, device_path), DEVICE_IFACE
-            )
-            device.Connect()
-            self._clog("info", "device.connect.ok",
-                       f"Device1.Connect succeeded on {device_address}",
-                       address=device_address)
-            return True
-        except dbus.DBusException as e:
-            # Already-connected is not an error for us — the link is up.
-            msg = str(e)
-            if "Already Connected" in msg or "AlreadyConnected" in msg:
-                self._clog("info", "device.connect.already",
-                           f"{device_address} already connected",
-                           address=device_address)
-                return True
-            self._clog("warn", "device.connect.fail",
-                       f"Device1.Connect failed on {device_address}: {msg}",
-                       address=device_address)
-            return False
-
     def disconnect_device(self, device_address, adapter_name=None):
         """Tear down the whole ACL link to a device (all profiles)."""
         device_path = self._find_device_path(device_address, adapter_name)
@@ -394,13 +356,19 @@ class BluetoothManager:
         except dbus.DBusException:
             return False
 
-    def connect_profile(self, device_address, uuid, adapter_name=None):
+    def connect_profile(self, device_address, uuid, adapter_name=None,
+                        silent=False):
         """Ask BlueZ to connect a specific profile UUID on the given device.
 
         This marks the connection as belonging to that profile (e.g. SPP)
         instead of whatever BlueZ decides from the device's advertised
         services (which may default to audio/HID when the remote announces
         multiple profiles).
+
+        ``silent=True`` suppresses the connection-log emission (used by the
+        PLC reconnect loop, which would otherwise publish two lines every
+        few seconds whenever the PLC is offline).  The stdlib logger still
+        sees everything.
         """
         device_path = self._find_device_path(device_address, adapter_name)
         if not device_path:
@@ -412,21 +380,24 @@ class BluetoothManager:
             )
             device.ConnectProfile(uuid)
             logger.info("ConnectProfile(%s) on %s", uuid, device_address)
-            self._clog("info", "profile.connect.ok",
-                       f"ConnectProfile({_uuid_label(uuid)}) on {device_address}",
-                       address=device_address, uuid=str(uuid))
+            if not silent:
+                self._clog("info", "profile.connect.ok",
+                           f"ConnectProfile({_uuid_label(uuid)}) on {device_address}",
+                           address=device_address, uuid=str(uuid))
             return True
         except dbus.DBusException as e:
             logger.warning("ConnectProfile(%s) on %s failed: %s",
                            uuid, device_address, e)
-            self._clog("warn", "profile.connect.fail",
-                       f"ConnectProfile({_uuid_label(uuid)}) on {device_address} "
-                       f"failed: {e}",
-                       address=device_address, uuid=str(uuid))
+            if not silent:
+                self._clog("warn", "profile.connect.fail",
+                           f"ConnectProfile({_uuid_label(uuid)}) on {device_address} "
+                           f"failed: {e}",
+                           address=device_address, uuid=str(uuid))
             return False
 
     def disconnect_profile(self, device_address, uuid, adapter_name=None,
-                           only_if_connected=True, only_if_advertised=True):
+                           only_if_connected=True, only_if_advertised=True,
+                           silent=False):
         """Disconnect a specific profile on a device (e.g. HID) without
         touching other connected profiles.
 
@@ -450,19 +421,21 @@ class BluetoothManager:
         if only_if_connected and not self.is_device_connected(
             device_address, adapter_name
         ):
-            self._clog("debug", "profile.disconnect.skip",
-                       f"Skip DisconnectProfile({_uuid_label(uuid)}) — "
-                       f"{device_address} is not currently connected",
-                       address=device_address, uuid=str(uuid))
+            if not silent:
+                self._clog("debug", "profile.disconnect.skip",
+                           f"Skip DisconnectProfile({_uuid_label(uuid)}) — "
+                           f"{device_address} is not currently connected",
+                           address=device_address, uuid=str(uuid))
             return False
 
         if only_if_advertised:
             advertised = self.get_device_uuids(device_address, adapter_name)
             if str(uuid).lower() not in advertised:
-                self._clog("debug", "profile.disconnect.skip",
-                           f"Skip DisconnectProfile({_uuid_label(uuid)}) — "
-                           f"{device_address} does not advertise this profile",
-                           address=device_address, uuid=str(uuid))
+                if not silent:
+                    self._clog("debug", "profile.disconnect.skip",
+                               f"Skip DisconnectProfile({_uuid_label(uuid)}) — "
+                               f"{device_address} does not advertise this profile",
+                               address=device_address, uuid=str(uuid))
                 return False
 
         try:
@@ -471,17 +444,19 @@ class BluetoothManager:
             )
             device.DisconnectProfile(uuid)
             logger.info("DisconnectProfile(%s) on %s", uuid, device_address)
-            self._clog("info", "profile.disconnect.ok",
-                       f"DisconnectProfile({_uuid_label(uuid)}) on {device_address}",
-                       address=device_address, uuid=str(uuid))
+            if not silent:
+                self._clog("info", "profile.disconnect.ok",
+                           f"DisconnectProfile({_uuid_label(uuid)}) on {device_address}",
+                           address=device_address, uuid=str(uuid))
             return True
         except dbus.DBusException as e:
             logger.warning("DisconnectProfile(%s) on %s failed: %s",
                            uuid, device_address, e)
-            self._clog("debug", "profile.disconnect.fail",
-                       f"DisconnectProfile({_uuid_label(uuid)}) on {device_address} "
-                       f"failed: {e}",
-                       address=device_address, uuid=str(uuid))
+            if not silent:
+                self._clog("debug", "profile.disconnect.fail",
+                           f"DisconnectProfile({_uuid_label(uuid)}) on {device_address} "
+                           f"failed: {e}",
+                           address=device_address, uuid=str(uuid))
             return False
 
     def set_device_trusted(self, device_address, trusted=True, adapter_name=None):

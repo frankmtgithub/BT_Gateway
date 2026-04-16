@@ -243,10 +243,6 @@ class DeviceServer:
         # scanners don't act as keyboards).
         self._auto_connect_thread = None
         self._auto_connect_running = False
-        # HID→SPP handover state: address → threading.Event that stops
-        # the handover keepalive thread for that device.
-        self._handover_stops = {}
-        self._handover_threads = {}
         # Pair guard — while active, the auto-connect loop leaves every
         # device alone so the user's pair attempt has exclusive D-Bus
         # access (otherwise auto-connect's 5s page-timeouts cause Pair
@@ -439,10 +435,6 @@ class DeviceServer:
                    f"SPP accepted from {device_name} ({address})",
                    address=address)
 
-        # A successful SPP connection cancels any in-flight handover for
-        # this device — we got what we were waiting for.
-        self._stop_handover_unlocked(address, reason="spp.connected")
-
         # Clear auto-connect backoff state: this scanner is clearly alive.
         with self._lock:
             self._auto_connect_next.pop(address, None)
@@ -589,7 +581,6 @@ class DeviceServer:
         # Snapshot state under lock; then work outside it.
         with self._lock:
             connected = set(self._connections.keys())
-            in_handover = set(self._handover_stops.keys())
             next_allowed = dict(self._auto_connect_next)
 
         for addr, dev in self._config.get_enabled_devices().items():
@@ -603,10 +594,6 @@ class DeviceServer:
                 with self._lock:
                     self._auto_connect_next.pop(addr, None)
                     self._auto_connect_fails.pop(addr, None)
-                continue
-            if addr in in_handover:
-                # A dedicated thread is driving this device right now.
-                # Don't race it.
                 continue
             # Respect per-device backoff: don't keep hammering an offline
             # scanner with 5-second page-timeout blocks.
@@ -684,152 +671,6 @@ class DeviceServer:
             self._pair_guard_until = 0.0
             self._clog("info", "auto.pair_guard_off",
                        "Auto-connect resumed (pair guard cleared)")
-
-    # ── HID → SPP handover ─────────────────────────────────────────────
-
-    def start_handover(self, address):
-        """Begin the HID→SPP handover flow for ``address``.
-
-        The user pairs a scanner in HID (keyboard) mode, then scans the
-        vendor "switch to SPP" barcode.  For that transition to land on
-        our SPP listener reliably, two things need to be true at the
-        instant the scanner switches:
-
-        1. The ACL link to the scanner is already up.  We force that by
-           calling ``Device1.Connect`` which pulls HID up.
-        2. Our SPP profile is registered on the device's ``listen_channel``.
-           We call :meth:`refresh_profiles` to be sure.
-
-        After that we spawn a short-lived keepalive thread that re-asserts
-        both conditions every 2 s for a handover window (default 90 s),
-        logs everything, and bails out as soon as SPP actually connects
-        (``accept_connection`` calls :meth:`_stop_handover_unlocked`).
-        """
-        address = address.upper()
-        devices = self._config.get_devices()
-        dev = devices.get(address)
-        if dev is None:
-            self._clog("warn", "handover.unknown",
-                       f"start_handover called for unknown device {address}",
-                       address=address)
-            return False
-        if self._is_plc_paired_address(address):
-            self._clog("warn", "handover.plc_lockout",
-                       f"{address} belongs to the PLC adapter; refusing handover",
-                       address=address)
-            return False
-        channel = int(dev.get("listen_channel") or 0)
-
-        with self._lock:
-            if address in self._handover_stops:
-                self._clog("info", "handover.already",
-                           f"Handover already running for {address}",
-                           address=address, channel=channel)
-                return True
-            stop = threading.Event()
-            self._handover_stops[address] = stop
-
-        # Make sure the SPP listener for this device's channel is live
-        # BEFORE we touch the scanner.  Scanners often flip to SPP within
-        # 1–2 s of the barcode scan, so the listener must be ready first.
-        self.refresh_profiles()
-
-        self._clog("info", "handover.start",
-                   f"Handover armed for {address} on channel {channel}. "
-                   "Bringing HID up now; scan the SPP-mode barcode.",
-                   address=address, channel=channel)
-
-        thread = threading.Thread(
-            target=self._handover_loop,
-            args=(address, channel, stop),
-            daemon=True,
-            name=f"handover-{address}",
-        )
-        with self._lock:
-            self._handover_threads[address] = thread
-        thread.start()
-        return True
-
-    def stop_handover(self, address, reason="user.cancel"):
-        """Cancel any in-flight handover for ``address``."""
-        address = address.upper()
-        self._stop_handover_unlocked(address, reason=reason)
-
-    def _stop_handover_unlocked(self, address, reason="unknown"):
-        with self._lock:
-            stop = self._handover_stops.pop(address, None)
-            thread = self._handover_threads.pop(address, None)
-        if stop is None:
-            return
-        stop.set()
-        self._clog("info", "handover.stop",
-                   f"Handover for {address} stopped ({reason})",
-                   address=address, reason=reason)
-        # Don't join from callers that may be inside the thread itself
-        # (e.g. accept_connection).  Daemon threads exit on their own.
-
-    def _handover_loop(self, address, channel, stop):
-        adapter = self._config.get("device_adapter", "")
-        deadline = time.monotonic() + 90.0  # 90s handover window
-
-        # Kick: force the ACL link up.  Scanners in HID mode will come up
-        # as a keyboard; that's fine — we just need the link alive.
-        if self._bt_manager.connect_device(address, adapter):
-            self._clog("info", "handover.hid_up",
-                       f"ACL link to {address} is up. SPP listener armed "
-                       f"on channel {channel}. "
-                       "Scan the 'switch to SPP' barcode now.",
-                       address=address, channel=channel)
-        else:
-            self._clog("warn", "handover.hid_fail",
-                       f"Could not bring {address} up via Device1.Connect. "
-                       "Is the scanner in range and powered on?",
-                       address=address, channel=channel)
-
-        # Keepalive: re-register the SPP profile and nudge BlueZ every
-        # 2 s.  Bail out if someone called stop_handover (which fires when
-        # SPP accepts, when the user cancels, or when the window elapses).
-        tick = 0
-        while not stop.is_set() and time.monotonic() < deadline:
-            tick += 1
-            # The profile may have been torn down if the user flipped
-            # another device's enabled flag — refresh to be sure.
-            self.refresh_profiles()
-            if tick % 5 == 0:
-                still_up = self._bt_manager.is_device_connected(address, adapter)
-                self._clog(
-                    "debug", "handover.keepalive",
-                    f"Handover keepalive tick {tick}: ACL "
-                    f"{'up' if still_up else 'down'}, "
-                    f"SPP listener on channel {channel} active.",
-                    address=address, channel=channel,
-                )
-                if not still_up:
-                    # The scanner may have dropped HID to switch modes.
-                    # Try to re-pull it up so it doesn't sleep during the
-                    # transition window.
-                    self._bt_manager.connect_device(address, adapter)
-            if stop.wait(2.0):
-                break
-
-        # If we fell out of the loop without SPP arriving, say so plainly.
-        with self._lock:
-            still_running = address in self._handover_stops
-        if still_running:
-            self._clog(
-                "warn", "handover.timeout",
-                f"Handover window expired for {address} without an SPP "
-                f"connection on channel {channel}. Check that the scanner "
-                "actually switched modes and that no other device is "
-                "claiming this channel.",
-                address=address, channel=channel,
-            )
-            self._stop_handover_unlocked(address, reason="timeout")
-
-    @property
-    def active_handovers(self):
-        with self._lock:
-            return sorted(self._handover_stops.keys())
 
     def set_pairing_mode(self, enabled, adapter_name=None):
         """Enable or disable pairing mode (discoverable + pairable).

@@ -739,34 +739,6 @@ def api_set_device_listen_channel(address):
     return jsonify({"status": "ok", "listen_channel": channel})
 
 
-# ── HID → SPP handover API ──────────────────────────────────────────────────
-
-@bp.route("/api/devices/<address>/handover/start", methods=["POST"])
-def api_handover_start(address):
-    """Hold the scanner connected in HID mode while the SPP listener is
-    armed, so the user can scan the vendor 'switch to SPP' barcode on
-    a live ACL link and have the mode change land on us reliably.
-    """
-    address = address.replace("-", ":").upper()
-    if not current_app.device_server.start_handover(address):
-        return jsonify({"error": "Device is not paired on this adapter"}), 400
-    return jsonify({"status": "handover_started", "address": address})
-
-
-@bp.route("/api/devices/<address>/handover/stop", methods=["POST"])
-def api_handover_stop(address):
-    address = address.replace("-", ":").upper()
-    current_app.device_server.stop_handover(address, reason="user.cancel")
-    return jsonify({"status": "handover_stopped", "address": address})
-
-
-@bp.route("/api/handover/active")
-def api_handover_active():
-    return jsonify({
-        "addresses": current_app.device_server.active_handovers,
-    })
-
-
 # ── Connection log API ──────────────────────────────────────────────────────
 
 @bp.route("/api/connection-log")

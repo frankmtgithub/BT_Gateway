@@ -180,11 +180,17 @@ class PLCConnection:
         """Mark the PLC as trusted and ask BlueZ to bring up the SPP
         profile.  The PLC is always SPP — HID/audio disconnect logic
         belongs on the devices side, not here.
+
+        ``silent=True`` on the profile calls keeps the connection-log
+        (which is a user-facing UI panel focused on scanner traffic)
+        free of the 5-second PLC reconnect churn.  Python's stdlib
+        logger still records everything for diagnostics.
         """
         self._bt_manager.set_device_trusted(address, True, adapter_name)
         # Ask BlueZ to bring up SPP specifically.  Best-effort: if the
         # channel is already open, this succeeds silently.
-        self._bt_manager.connect_profile(address, SPP_UUID, adapter_name)
+        self._bt_manager.connect_profile(address, SPP_UUID, adapter_name,
+                                         silent=True)
 
     def _connect(self, address, channel, adapter_name):
         """Attempt to connect to the PLC over RFCOMM."""
@@ -381,7 +387,8 @@ class PLCConnection:
             addr = self._current_address
             adapter = self._config.get("plc_adapter", "")
             if addr:
-                self._bt_manager.disconnect_profile(addr, SPP_UUID, adapter)
+                self._bt_manager.disconnect_profile(addr, SPP_UUID, adapter,
+                                                    silent=True)
         except Exception:
             pass
 
