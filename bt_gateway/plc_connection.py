@@ -23,16 +23,12 @@ except ImportError:
     BTPROTO_RFCOMM = 3
 
 SPP_UUID = "00001101-0000-1000-8000-00805f9b34fb"
-HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
-A2DP_SINK_UUID = "0000110b-0000-1000-8000-00805f9b34fb"
-A2DP_SOURCE_UUID = "0000110a-0000-1000-8000-00805f9b34fb"
-HFP_HF_UUID = "0000111e-0000-1000-8000-00805f9b34fb"
-HSP_HS_UUID = "00001108-0000-1000-8000-00805f9b34fb"
 
-# Non-SPP profiles we actively disconnect to stop BlueZ classifying the
-# PLC link as an audio / HID connection.
-NON_SPP_UUIDS = [HID_UUID, A2DP_SINK_UUID, A2DP_SOURCE_UUID,
-                 HFP_HF_UUID, HSP_HS_UUID]
+# The PLC side is always Serial Port Profile — only scanners / remote
+# devices ever need the HID→SPP handover.  Any other profile on the PLC
+# address is therefore unexpected, and we don't try to disconnect HID /
+# audio defensively because doing so used to spam BlueZ with UUIDs the
+# PLC never advertised.
 
 RECV_BUFFER = 4096
 
@@ -181,21 +177,13 @@ class PLCConnection:
     # ── Connect helpers ────────────────────────────────────────────────
 
     def _prepare_plc_link(self, address, adapter_name):
-        """Ensure the PLC is trusted and that any non-SPP profiles that
-        BlueZ may have auto-connected (audio, HID) are disconnected.
-
-        Then explicitly request that BlueZ connect the SPP profile so the
-        link is tracked as Serial Port, not Audio.  This is a best-effort
-        call — if BlueZ has already opened the channel it will succeed
-        silently.
+        """Mark the PLC as trusted and ask BlueZ to bring up the SPP
+        profile.  The PLC is always SPP — HID/audio disconnect logic
+        belongs on the devices side, not here.
         """
         self._bt_manager.set_device_trusted(address, True, adapter_name)
-
-        # Kill any audio/HID profile that BlueZ brought up automatically.
-        for uuid in NON_SPP_UUIDS:
-            self._bt_manager.disconnect_profile(address, uuid, adapter_name)
-
-        # Ask BlueZ to bring up SPP specifically.
+        # Ask BlueZ to bring up SPP specifically.  Best-effort: if the
+        # channel is already open, this succeeds silently.
         self._bt_manager.connect_profile(address, SPP_UUID, adapter_name)
 
     def _connect(self, address, channel, adapter_name):

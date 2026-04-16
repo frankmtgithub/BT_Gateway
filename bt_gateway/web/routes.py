@@ -445,15 +445,10 @@ def api_plc_pair():
         if not current_app.bt_manager.pair_device(address, adapter):
             return jsonify({"error": "Pairing failed"}), 500
 
-        # Force SPP — kill any audio/HID that BlueZ may have connected.
-        # disconnect_profile is now skipped automatically when the device
-        # doesn't advertise the UUID, so this is no longer spammy.
-        for uuid in (HID_UUID,
-                     "0000110b-0000-1000-8000-00805f9b34fb",
-                     "0000110a-0000-1000-8000-00805f9b34fb",
-                     "0000111e-0000-1000-8000-00805f9b34fb",
-                     "00001108-0000-1000-8000-00805f9b34fb"):
-            current_app.bt_manager.disconnect_profile(address, uuid, adapter)
+        # PLC is always SPP — ask BlueZ to bring that profile up and
+        # stop discovery.  No HID/audio disconnect dance is needed here:
+        # that belongs on the devices side where scanners arrive in HID
+        # mode before flipping to SPP.
         current_app.bt_manager.connect_profile(address, SPP_UUID, adapter)
         current_app.bt_manager.stop_discovery(adapter)
     finally:
