@@ -617,11 +617,14 @@ class DeviceServer:
             channel = int(dev.get("listen_channel") or 0) or None
             logger.debug("Auto-connect: attempting SPP on %s", addr)
             self._clog("debug", "auto.tick",
-                       f"Auto-connect: dropping HID and asking for SPP on {addr}",
+                       f"Auto-connect: asking for SPP on {addr}",
                        address=addr, channel=channel)
-            # Drop HID only if it's actually up — avoids InvalidArguments
-            # on every tick when the scanner isn't connected.
-            self._bt_manager.disconnect_profile(addr, HID_UUID, adapter_name)
+            # Don't drop HID here.  If the scanner is still in HID
+            # (keyboard) mode — e.g. freshly paired and waiting for the
+            # operator to scan the "switch to SPP" barcode — kicking
+            # HID every 10 s would tear its link down repeatedly.
+            # HID is only dropped once the scanner has actually chosen
+            # SPP (see _on_new_connection).
             ok = self._bt_manager.connect_profile(addr, SPP_UUID, adapter_name)
             if ok:
                 with self._lock:

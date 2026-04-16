@@ -291,14 +291,25 @@ def api_pair_device():
         current_app.device_server.begin_pair_guard(90)
         success = current_app.bt_manager.pair_device(address, adapter_name)
         if success:
-            # Force SPP, kill HID so barcode scanners don't act as keyboards
-            current_app.bt_manager.disconnect_profile(address, HID_UUID, adapter_name)
-            current_app.bt_manager.connect_profile(address, SPP_UUID, adapter_name)
+            # Do NOT disconnect HID or force SPP here.  Scanners ship in
+            # HID (keyboard) mode and the operator flow is:
+            #   1. Pair — scanner stays connected as a keyboard.
+            #   2. Scan the vendor "switch to SPP" barcode on the
+            #      scanner while it's still connected in HID.
+            #   3. The scanner reboots its BT stack, flips to SPP, and
+            #      initiates RFCOMM back into our listener on its
+            #      configured channel.
+            # Tearing down HID right after pair breaks step 2 — the
+            # scanner sees the link go down before the operator can
+            # scan the mode-switch barcode.  HID gets dropped later,
+            # in _on_new_connection, only once the scanner has actually
+            # chosen SPP.
             entry = current_app.gateway_config.add_device(address)
             name = entry["name"] if isinstance(entry, dict) else entry
             port = entry["port"] if isinstance(entry, dict) else None
-            # Bring up the SPP listener now so the scanner can initiate its
-            # side of the connection as soon as it switches to SPP mode.
+            # Bring up the SPP listener on the device's configured
+            # channel so the scanner lands on the same /dev/rfcomm<N>
+            # every time it flips to SPP mode.
             current_app.device_server.refresh_profiles()
             return jsonify({
                 "status": "paired", "name": name, "port": port,

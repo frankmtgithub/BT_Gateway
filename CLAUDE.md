@@ -101,6 +101,36 @@ User's ask:
   into `detail`.  `detail` is the human-readable sentence; `step`
   is what the UI filters and groups by.
 
+## Session 2026-04-16 (late) — keep HID alive until barcode-switch
+
+The "force SPP, kill HID" logic on the devices side was too eager:
+it tore HID down right after `Pair()` and again on every 10 s
+auto-connect tick, which meant a scanner that had just been paired
+in keyboard mode got kicked off the link before the operator could
+scan the vendor "switch to SPP" barcode.
+
+New contract — mirrors the Windows flow the user is used to:
+
+* `Pair()` succeeds → scanner stays connected as HID.  No
+  `DisconnectProfile(HID)`, no `ConnectProfile(SPP)` at pair time.
+* Operator scans the switch-to-SPP barcode → scanner reboots and
+  initiates RFCOMM into our listener on its **configured**
+  `listen_channel` (per-device, deterministic — that's the
+  "same /dev/rfcomm<N> every time" invariant).
+* `_on_new_connection` (SPP accepted) → that's when we drop HID on
+  the scanner so barcode reads don't leak to the Pi desktop as
+  keystrokes.
+* Auto-connect loop: nudges `ConnectProfile(SPP)` on disconnected
+  paired devices but **no longer** calls `DisconnectProfile(HID)`.
+  For devices already on SPP we keep the periodic HID-off call as
+  a safety net in case BlueZ opportunistically re-raised HID.
+
+Call sites touched: `routes.api_pair_device`,
+`device_server._auto_connect_tick` (disconnected branch).  Handover
+flow (`start_handover` / "Prepare for SPP mode" button) is
+unchanged — still available for troubleshooting scanners that
+won't come up on their own.
+
 ## Repo pointers
 
 * Entry point: `run.py`
