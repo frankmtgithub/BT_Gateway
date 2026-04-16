@@ -225,13 +225,16 @@ def api_remove_device():
     if not address:
         return jsonify({"error": "No address provided"}), 400
 
-    adapter_name = _resolve_pairing_adapter(data)
-
-    # Disconnect if active
+    # Disconnect our SPP bookkeeping first so the socket read loop exits
+    # before BlueZ tears the ACL down.
     current_app.device_server.disconnect_device(address)
 
-    # Remove from BlueZ
-    current_app.bt_manager.remove_device(address, adapter_name)
+    # Unscoped removal: nuke the BlueZ record for this MAC on every
+    # adapter, not just the devices one.  Passing adapter_name would
+    # leave stale bondings on the PLC adapter (or on hci0 even when the
+    # devices side is hci1), which is what was making the scanner keep
+    # popping up in the desktop Bluetooth applet after "remove".
+    current_app.bt_manager.remove_device(address, adapter_name=None)
     # Remove from config (also releases port)
     current_app.gateway_config.remove_device(address)
     # The removed device may have been the only one using a given channel;
@@ -243,16 +246,14 @@ def api_remove_device():
 @bp.route("/api/pairing/remove-all", methods=["POST"])
 def api_remove_all():
     """Disconnect and unpair all devices."""
-    data = request.get_json(silent=True) or {}
-    adapter_name = _resolve_pairing_adapter(data)
-
     # Disconnect all active connections
     current_app.device_server.disconnect_all()
 
-    # Remove all from BlueZ
+    # Remove all from BlueZ — unscoped so every trace of each paired
+    # address is purged on every adapter.
     devices = current_app.gateway_config.get_devices()
     for address in devices:
-        current_app.bt_manager.remove_device(address, adapter_name)
+        current_app.bt_manager.remove_device(address, adapter_name=None)
 
     # Clear config
     current_app.gateway_config.remove_all_devices()

@@ -480,24 +480,99 @@ class BluetoothManager:
         paired = self.list_paired_devices(adapter_name)
         return paired[0] if paired else None
 
-    def remove_device(self, device_address, adapter_name=None):
-        """Remove (unpair) a device."""
-        device_path = self._find_device_path(device_address, adapter_name)
-        if not device_path:
-            logger.error("Device %s not found for removal", device_address)
-            return False
-        # Get the adapter path from the device path
-        adapter_path = "/".join(device_path.split("/")[:-1])
+    def list_all_device_paths(self, device_address):
+        """Return ``[(device_path, adapter_path), ...]`` for every BlueZ
+        record of this address across every adapter.
+
+        Used by :meth:`remove_device` to purge every copy — BlueZ keeps
+        a separate ``Device1`` object per adapter, and a device that is
+        paired on both adapters (or has stale state on one of them)
+        won't look "gone" to the OS until all copies are removed.
+        """
+        results = []
         try:
-            adapter = dbus.Interface(
-                self._bus.get_object(BLUEZ_SERVICE, adapter_path), ADAPTER_IFACE
+            om = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, "/"), OM_IFACE
             )
-            adapter.RemoveDevice(device_path)
-            logger.info("Removed device %s", device_address)
-            return True
+            objects = om.GetManagedObjects()
+            for path, interfaces in objects.items():
+                if DEVICE_IFACE not in interfaces:
+                    continue
+                props = interfaces[DEVICE_IFACE]
+                addr = str(props.get("Address", "")).upper()
+                if addr == device_address.upper():
+                    adapter_path = str(props.get("Adapter", ""))
+                    results.append((str(path), adapter_path))
         except dbus.DBusException as e:
-            logger.error("Failed to remove %s: %s", device_address, e)
+            logger.error("Failed to enumerate devices: %s", e)
+        return results
+
+    def remove_device(self, device_address, adapter_name=None):
+        """Remove (unpair) a device, by default purging every BlueZ
+        record of it on every adapter.
+
+        Pass ``adapter_name`` to scope removal to a single adapter.
+        Otherwise we nuke the device wherever BlueZ knows about it —
+        that matches the user's mental model ("I removed it from the
+        app, it should be gone everywhere") and stops the desktop
+        Bluetooth applet from flickering connect/disconnect events
+        because a stale bonding survived on another adapter.
+
+        Before each ``Adapter1.RemoveDevice`` we call
+        ``Device1.Disconnect`` so the ACL link is torn down first; if
+        we skip that, the kernel can hold the link up long enough for
+        a scanner to keep auto-reconnecting during the removal.
+        """
+        instances = self.list_all_device_paths(device_address)
+        if adapter_name:
+            suffix = "/" + adapter_name
+            instances = [(p, a) for (p, a) in instances
+                         if a.endswith(suffix)]
+        if not instances:
+            logger.error("Device %s not found for removal", device_address)
+            self._clog("warn", "device.remove.not_found",
+                       f"{device_address} not present in BlueZ "
+                       f"(scope: {adapter_name or 'all adapters'})",
+                       address=device_address)
             return False
+
+        removed_any = False
+        for device_path, adapter_path in instances:
+            adapter_short = adapter_path.split("/")[-1] or adapter_path
+            # Drop the ACL first so the kernel doesn't hold the link
+            # up long enough for the scanner to auto-reconnect.
+            try:
+                device = dbus.Interface(
+                    self._bus.get_object(BLUEZ_SERVICE, device_path),
+                    DEVICE_IFACE,
+                )
+                try:
+                    device.Disconnect()
+                except dbus.DBusException:
+                    # Not connected — nothing to tear down.
+                    pass
+            except dbus.DBusException:
+                pass
+            try:
+                adapter = dbus.Interface(
+                    self._bus.get_object(BLUEZ_SERVICE, adapter_path),
+                    ADAPTER_IFACE,
+                )
+                adapter.RemoveDevice(device_path)
+                logger.info("Removed device %s from %s",
+                            device_address, adapter_short)
+                self._clog("info", "device.remove",
+                           f"Unpaired {device_address} from {adapter_short}",
+                           address=device_address, adapter=adapter_short)
+                removed_any = True
+            except dbus.DBusException as e:
+                logger.error("Failed to remove %s from %s: %s",
+                             device_address, adapter_short, e)
+                self._clog("warn", "device.remove.fail",
+                           f"RemoveDevice({device_address}) on "
+                           f"{adapter_short} failed: {e}",
+                           address=device_address, adapter=adapter_short)
+        return removed_any
 
     def _find_device_path(self, device_address, adapter_name=None):
         """Find the D-Bus object path for a device by its BT address."""
