@@ -101,6 +101,37 @@
             </div>
           </div>
 
+          <div class="border rounded p-3 mb-3">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+              <h6 class="mb-0"><i class="bi bi-heart-pulse"></i> Keep-Alive</h6>
+              <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox"
+                       id="wiz-plc-keepalive-enabled">
+                <label class="form-check-label" for="wiz-plc-keepalive-enabled">
+                  Enabled
+                </label>
+              </div>
+            </div>
+            <p class="text-muted small mb-2">
+              Periodically send a message to the PLC while connected so the
+              remote end knows the link is alive.  A newline is appended.
+            </p>
+            <div class="row g-3">
+              <div class="col-md-4">
+                <label class="form-label">Interval (s)</label>
+                <input type="number" class="form-control"
+                       id="wiz-plc-keepalive-interval"
+                       min="1" max="3600" value="30">
+              </div>
+              <div class="col-md-8">
+                <label class="form-label">Message</label>
+                <input type="text" class="form-control"
+                       id="wiz-plc-keepalive-message"
+                       maxlength="256" value="PING">
+              </div>
+            </div>
+          </div>
+
           <div class="d-flex gap-2 mb-3 flex-wrap align-items-center">
             <button class="btn btn-success" id="wiz-plc-scan">
               <i class="bi bi-search"></i> Scan for PLC
@@ -383,6 +414,13 @@ function loadPlcSettings() {
   fetch('/api/settings').then(r => r.json()).then(cfg => {
     document.getElementById('wiz-plc-channel').value = cfg.plc_channel || 1;
     document.getElementById('wiz-plc-reconnect').value = cfg.plc_reconnect_interval || 5;
+    document.getElementById('wiz-plc-keepalive-enabled').checked =
+      !!cfg.plc_keepalive_enabled;
+    document.getElementById('wiz-plc-keepalive-interval').value =
+      Number.isFinite(cfg.plc_keepalive_interval) && cfg.plc_keepalive_interval > 0
+        ? cfg.plc_keepalive_interval : 30;
+    document.getElementById('wiz-plc-keepalive-message').value =
+      cfg.plc_keepalive_message != null ? cfg.plc_keepalive_message : 'PING';
     fetch('/api/ports/available').then(r => r.json()).then(d => {
       const ports = d.ports || [];
       const sel = document.getElementById('wiz-plc-port');
@@ -518,10 +556,18 @@ function unpairPlc() {
 }
 
 function saveStep2() {
+  const kaInterval = parseInt(
+    document.getElementById('wiz-plc-keepalive-interval').value);
   const data = {
     plc_channel: parseInt(document.getElementById('wiz-plc-channel').value) || 1,
     plc_port: parseInt(document.getElementById('wiz-plc-port').value),
     plc_reconnect_interval: parseInt(document.getElementById('wiz-plc-reconnect').value) || 5,
+    plc_keepalive_enabled:
+      document.getElementById('wiz-plc-keepalive-enabled').checked,
+    plc_keepalive_interval:
+      Number.isFinite(kaInterval) && kaInterval > 0 ? kaInterval : 30,
+    plc_keepalive_message:
+      document.getElementById('wiz-plc-keepalive-message').value,
   };
   fetch('/api/settings', {
     method: 'POST',
