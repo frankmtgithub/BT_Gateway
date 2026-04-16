@@ -615,6 +615,23 @@ class DeviceServer:
                 continue
 
             channel = int(dev.get("listen_channel") or 0) or None
+            # If the device isn't currently advertising SPP (e.g. it's
+            # still in HID/keyboard mode, pre-barcode-switch), don't
+            # call ConnectProfile(SPP) — BlueZ will fail with
+            # br-connection-profile-unavailable AND can tear down the
+            # ACL link as a side effect, kicking the scanner off HID.
+            # Wait for the scanner to flip to SPP and initiate the
+            # RFCOMM connection into our listener instead.
+            try:
+                uuids = self._bt_manager.get_device_uuids(addr, adapter_name)
+            except Exception:
+                uuids = []
+            if uuids and SPP_UUID.lower() not in uuids:
+                self._clog("debug", "auto.skip.no_spp",
+                           f"Auto-connect skipped for {addr}: device does "
+                           "not advertise SPP (still in HID mode).",
+                           address=addr, channel=channel)
+                continue
             logger.debug("Auto-connect: attempting SPP on %s", addr)
             self._clog("debug", "auto.tick",
                        f"Auto-connect: asking for SPP on {addr}",

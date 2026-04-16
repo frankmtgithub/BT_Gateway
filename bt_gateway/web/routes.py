@@ -311,6 +311,16 @@ def api_pair_device():
             # channel so the scanner lands on the same /dev/rfcomm<N>
             # every time it flips to SPP mode.
             current_app.device_server.refresh_profiles()
+            # Some scanners drop the BT radio immediately after Pair()
+            # completes and go back to sleep.  Kick Device1.Connect and
+            # keep it alive so the operator has a live HID link to scan
+            # the "switch to SPP" barcode on.  start_handover is
+            # idempotent — if the scanner has already vanished, the
+            # keepalive thread will retry for 90 s and then give up.
+            try:
+                current_app.device_server.start_handover(address)
+            except Exception:
+                pass
             return jsonify({
                 "status": "paired", "name": name, "port": port,
                 "adapter": adapter_name,
