@@ -1,12 +1,14 @@
 FROM python:3.11-slim-bookworm
 
-# Install BlueZ, D-Bus, and build dependencies for PyGObject / dbus-python
+# Install BlueZ, D-Bus, and build dependencies for PyGObject / dbus-python.
+# libcairo2-dev is required because PyGObject pulls pycairo in as a build dep.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bluez \
         dbus \
         libdbus-1-dev \
         libglib2.0-dev \
         libgirepository1.0-dev \
+        libcairo2-dev \
         gcc \
         pkg-config \
         python3-dev \
