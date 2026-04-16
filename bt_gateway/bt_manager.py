@@ -130,7 +130,53 @@ class BluetoothManager:
             return False
 
     def power_adapter(self, adapter_name, on=True):
+        """Toggle an adapter's Powered property.
+
+        BlueZ refuses ``Powered=False`` while the adapter is still
+        discovering or while ``Discoverable``/``Pairable`` are asserted,
+        which is why the first click used to look like it did nothing
+        and the second one "worked".  Clear those first, then drop
+        power.  For ``on=True`` we just flip Powered.
+        """
+        if not on:
+            # Best-effort: stop any in-flight discovery so the adapter
+            # isn't holding a discovery session when we cut power.
+            path = self.get_adapter_path(adapter_name)
+            try:
+                adapter = dbus.Interface(
+                    self._bus.get_object(BLUEZ_SERVICE, path), ADAPTER_IFACE
+                )
+                adapter.StopDiscovery()
+                self._clog("debug", "adapter.power.stop_discovery",
+                           f"StopDiscovery on {adapter_name} before power-off",
+                           adapter=adapter_name)
+            except dbus.DBusException:
+                # "No discovery started" is fine — we're just draining.
+                pass
+            if self._discovery_adapter_path == path:
+                self._discovering = False
+                self._discovery_adapter_path = None
+            # Drop discoverable/pairable so bluetoothd isn't arguing with
+            # the power-off request.
+            self.set_adapter_property(adapter_name, "Discoverable", False)
+            self.set_adapter_property(adapter_name, "Pairable", False)
+            self._clog("info", "adapter.power",
+                       f"Powering OFF {adapter_name}",
+                       adapter=adapter_name)
+        else:
+            self._clog("info", "adapter.power",
+                       f"Powering ON {adapter_name}",
+                       adapter=adapter_name)
         return self.set_adapter_property(adapter_name, "Powered", on)
+
+    def set_adapter_alias(self, adapter_name, alias):
+        """Rename the adapter's Alias (the name other devices see)."""
+        ok = self.set_adapter_property(adapter_name, "Alias", str(alias))
+        if ok:
+            self._clog("info", "adapter.alias",
+                       f"Alias on {adapter_name} set to '{alias}'",
+                       adapter=adapter_name)
+        return ok
 
     def set_discoverable(self, adapter_name, discoverable=True, timeout=0):
         """Make adapter discoverable. timeout=0 means indefinite."""

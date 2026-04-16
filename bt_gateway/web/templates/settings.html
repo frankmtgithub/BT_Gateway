@@ -124,13 +124,30 @@
                     Only one PLC may be paired per adapter.  Pairing is automatic — PIN /
                     passkey confirmations are accepted by the gateway without user input.
                 </p>
-                <div class="d-flex gap-2 mb-3">
+                <div class="d-flex gap-2 mb-3 flex-wrap align-items-center">
                     <button class="btn btn-success" id="plc-discover-btn">
                         <i class="bi bi-search"></i> Scan for PLC
                     </button>
                     <button class="btn btn-secondary" id="plc-discover-stop-btn">
                         <i class="bi bi-stop-circle"></i> Stop Scan
                     </button>
+                    <div class="input-group input-group-sm ms-auto" style="max-width: 18rem;">
+                        <span class="input-group-text" id="plc-filter-label">
+                            <i class="bi bi-funnel"></i>
+                        </span>
+                        <input type="text"
+                               class="form-control"
+                               id="plc-discovered-filter"
+                               placeholder="Filter by name prefix…"
+                               aria-label="Filter PLCs by name prefix"
+                               aria-describedby="plc-filter-label">
+                        <button class="btn btn-outline-secondary"
+                                type="button"
+                                id="plc-discovered-filter-clear"
+                                title="Clear filter">
+                            <i class="bi bi-x"></i>
+                        </button>
+                    </div>
                 </div>
                 <div class="table-responsive">
                     <table class="table table-hover mb-0">
@@ -170,7 +187,7 @@
                                 <th>Address</th>
                                 <th>Powered</th>
                                 <th>Alias</th>
-                                <th class="text-end">Power</th>
+                                <th class="text-end">Actions</th>
                             </tr>
                         </thead>
                         <tbody id="adapters-tbody">
@@ -222,6 +239,14 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('plc-discover-stop-btn').addEventListener('click', stopPlcDiscovery);
     document.getElementById('plc-unpair-btn').addEventListener('click', unpairPlc);
 
+    const plcFilter = document.getElementById('plc-discovered-filter');
+    const plcFilterClear = document.getElementById('plc-discovered-filter-clear');
+    if (plcFilter) plcFilter.addEventListener('input', renderPlcDiscovered);
+    if (plcFilterClear) plcFilterClear.addEventListener('click', function() {
+        plcFilter.value = '';
+        renderPlcDiscovered();
+    });
+
     setInterval(refreshPlcStatus, 5000);
     setInterval(refreshPlcDiscovered, 5000);
 });
@@ -239,20 +264,21 @@ function loadAdapters() {
                     const poweredBadge = a.powered
                         ? '<span class="badge bg-success">Yes</span>'
                         : '<span class="badge bg-secondary">No</span>';
-                    const action = a.powered
+                    const power = a.powered
                         ? `<button class="btn btn-sm btn-outline-warning" onclick="setAdapterPower('${escAttr(a.name)}', false)">
                                <i class="bi bi-power"></i> Power Off
                            </button>`
                         : `<button class="btn btn-sm btn-outline-success" onclick="setAdapterPower('${escAttr(a.name)}', true)">
                                <i class="bi bi-power"></i> Power On
                            </button>`;
+                    const rename = `<button class="btn btn-sm btn-outline-primary ms-1" onclick="renameAdapter('${escAttr(a.name)}', '${escAttr(a.alias)}')" title="Rename adapter alias"><i class="bi bi-pencil"></i> Rename</button>`;
                     return `
                         <tr>
                             <td class="font-monospace">${escHtml(a.name)}</td>
                             <td class="font-monospace">${escHtml(a.address)}</td>
                             <td>${poweredBadge}</td>
                             <td>${escHtml(a.alias)}</td>
-                            <td class="text-end">${action}</td>
+                            <td class="text-end">${power}${rename}</td>
                         </tr>
                     `;
                 }).join('');
@@ -311,6 +337,21 @@ function loadSettings() {
                     if (current != null) sel.value = current;
                 });
         });
+}
+
+function renameAdapter(name, currentAlias) {
+    const proposed = prompt('New alias for ' + name + ':', currentAlias || name);
+    if (proposed === null) return;
+    const alias = proposed.trim();
+    if (!alias) { alert('Alias cannot be empty.'); return; }
+    fetch('/api/adapters/' + encodeURIComponent(name) + '/alias', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({alias: alias}),
+    }).then(r => r.json()).then(data => {
+        if (data.error) { alert('Rename failed: ' + data.error); return; }
+        loadAdapters();
+    }).catch(err => alert('Rename failed: ' + err));
 }
 
 function setAdapterPower(name, powered) {
@@ -381,6 +422,7 @@ function refreshPlcStatus() {
         .then(data => {
             const display = document.getElementById('plc-paired-display');
             const unpairBtn = document.getElementById('plc-unpair-btn');
+            window._plcPaired = !!data.paired;
             if (data.paired) {
                 display.textContent = data.paired.address + '  —  ' +
                     (data.paired.name || 'Unknown');
@@ -388,6 +430,16 @@ function refreshPlcStatus() {
             } else {
                 display.textContent = '(none)';
                 unpairBtn.disabled = true;
+            }
+
+            // Discovering while a PLC is already paired is pointless and
+            // fights the "single paired PLC per adapter" invariant, so
+            // disable the Scan button and force the badge to IDLE.
+            const scanBtn = document.getElementById('plc-discover-btn');
+            const badge = document.getElementById('plc-discovery-badge');
+            if (scanBtn) scanBtn.disabled = window._plcPaired;
+            if (window._plcPaired && badge) {
+                badge.textContent = 'IDLE'; badge.className = 'badge bg-secondary fs-6';
             }
 
             // Show the RFCOMM channel currently in use (discovered via SDP)
@@ -410,6 +462,13 @@ function refreshPlcStatus() {
 }
 
 function startPlcDiscovery() {
+    // Belt-and-suspenders: the backend already rejects this when a PLC
+    // is paired, but checking locally keeps us from kicking off a
+    // redundant scan round-trip every time the user clicks.
+    if (window._plcPaired) {
+        alert('A PLC is already paired on this adapter. Unpair it first to scan for a different one.');
+        return;
+    }
     fetch('/api/plc/discovery/start', {method: 'POST'})
         .then(r => r.json())
         .then(data => {
@@ -433,22 +492,67 @@ function refreshPlcDiscovered() {
     fetch('/api/plc/discovered')
         .then(r => r.json())
         .then(devices => {
-            const tbody = document.getElementById('plc-discovered-tbody');
-            if (!devices.length) {
-                tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-4">No devices on the PLC adapter.</td></tr>';
-                return;
-            }
-            tbody.innerHTML = devices.map(d => `
-                <tr>
-                    <td>${escHtml(d.name)}</td>
-                    <td class="font-monospace">${escHtml(d.address)}</td>
-                    <td>${d.paired ? '<span class="badge bg-success">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td>
-                    <td>
-                        ${d.paired ? '<em class="text-muted">already paired</em>' : `<button class="btn btn-sm btn-outline-success" onclick="pairPlc('${d.address}')"><i class="bi bi-link"></i> Pair as PLC</button>`}
-                    </td>
-                </tr>
-            `).join('');
+            // Cache so the filter input can re-render without re-hitting
+            // the API between poll cycles.
+            window._plcDiscovered = Array.isArray(devices) ? devices : [];
+            renderPlcDiscovered();
         });
+}
+
+function renderPlcDiscovered() {
+    const tbody = document.getElementById('plc-discovered-tbody');
+    const devices = Array.isArray(window._plcDiscovered) ? window._plcDiscovered : [];
+    if (!devices.length) {
+        tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-4">No devices on the PLC adapter.</td></tr>';
+        return;
+    }
+
+    const filterEl = document.getElementById('plc-discovered-filter');
+    const filter = (filterEl && filterEl.value ? filterEl.value : '').trim().toLowerCase();
+    let sorted = devices;
+    if (filter) {
+        sorted = devices
+            .map((d, i) => ({ d: d, i: i,
+                match: (d.name || '').toLowerCase().startsWith(filter) }))
+            .sort((a, b) => {
+                if (a.match !== b.match) return a.match ? -1 : 1;
+                return a.i - b.i;
+            })
+            .map(x => x.d);
+    }
+
+    tbody.innerHTML = sorted.map(d => {
+        const matches = filter && (d.name || '').toLowerCase().startsWith(filter);
+        const rowCls = matches ? ' class="table-primary"' : '';
+        const addrAttr = escAttr(d.address);
+        let primary;
+        if (d.paired) {
+            primary = '<em class="text-muted">already paired</em>';
+        } else if (window._plcPaired) {
+            primary = '<em class="text-muted">another PLC is paired</em>';
+        } else {
+            primary = `<button class="btn btn-sm btn-outline-success" onclick="pairPlc('${addrAttr}')"><i class="bi bi-link"></i> Pair as PLC</button>`;
+        }
+        // Force-forget: wipe this device's BlueZ record from every
+        // adapter so a stale entry stops coming back on every scan.
+        const forget = `<button class="btn btn-sm btn-outline-danger ms-1" onclick="forgetDevice('${addrAttr}')" title="Force-remove from BlueZ on every adapter"><i class="bi bi-trash"></i> Forget</button>`;
+        return `
+            <tr${rowCls}>
+                <td>${escHtml(d.name)}</td>
+                <td class="font-monospace">${escHtml(d.address)}</td>
+                <td>${d.paired ? '<span class="badge bg-success">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td>
+                <td>${primary}${forget}</td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function forgetDevice(address) {
+    if (!confirm('Force-remove ' + address + ' from BlueZ on every adapter?')) return;
+    fetch('/api/devices/' + encodeURIComponent(address) + '/forget',
+          {method: 'POST'})
+        .then(r => r.json())
+        .then(() => { refreshPlcDiscovered(); refreshPlcStatus(); });
 }
 
 function pairPlc(address) {

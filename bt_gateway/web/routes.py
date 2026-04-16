@@ -63,6 +63,24 @@ def api_adapters():
     return jsonify(adapters)
 
 
+@bp.route("/api/adapters/<adapter_name>/alias", methods=["POST"])
+def api_adapter_alias(adapter_name):
+    """Rename the adapter's Alias (the name other devices see).
+
+    Body: {"alias": "..."}
+    """
+    data = request.get_json(silent=True) or {}
+    alias = (data.get("alias") or "").strip()
+    if not alias:
+        return jsonify({"error": "Alias cannot be empty"}), 400
+    if len(alias) > 248:
+        return jsonify({"error": "Alias too long (max 248 chars)"}), 400
+    ok = current_app.bt_manager.set_adapter_alias(adapter_name, alias)
+    if not ok:
+        return jsonify({"error": f"Failed to rename {adapter_name}"}), 500
+    return jsonify({"status": "ok", "adapter": adapter_name, "alias": alias})
+
+
 @bp.route("/api/adapters/<adapter_name>/power", methods=["POST"])
 def api_adapter_power(adapter_name):
     """Power an adapter on or off.
@@ -121,12 +139,28 @@ def api_pairing_enable():
     if not adapter_name:
         return jsonify({"error": "No adapter selected"}), 400
 
-    # Make sure the adapter is powered before discovery
-    current_app.bt_manager.power_adapter(adapter_name, True)
+    # Make absolutely sure no other adapter is left in pairing /
+    # discovery state — otherwise a previously-used adapter could still
+    # be advertising Discoverable/Pairable and scanners could land on the
+    # wrong hardware.  Each adapter is addressed explicitly so nothing
+    # falls back onto the configured default.
+    bt = current_app.bt_manager
+    for other in bt.list_adapters():
+        if other["name"] == adapter_name:
+            continue
+        try:
+            bt.stop_discovery(other["name"])
+        except Exception:
+            pass
+        bt.set_discoverable(other["name"], False)
+        bt.set_pairable(other["name"], False)
+
+    # Make sure the chosen adapter is powered before discovery
+    bt.power_adapter(adapter_name, True)
 
     # Make discoverable/pairable on the chosen adapter and start discovery
     current_app.device_server.set_pairing_mode(True, adapter_name=adapter_name)
-    current_app.bt_manager.start_discovery(adapter_name)
+    bt.start_discovery(adapter_name)
     return jsonify({"status": "pairing_enabled", "adapter": adapter_name})
 
 
@@ -216,6 +250,33 @@ def api_pair_device():
     finally:
         with _PAIR_IN_FLIGHT_LOCK:
             _PAIR_IN_FLIGHT.discard(address)
+
+
+@bp.route("/api/devices/<address>/forget", methods=["POST"])
+def api_device_forget(address):
+    """Force BlueZ to drop a device record from every adapter.
+
+    Used on discovered-devices rows in the UI so the user can clear a
+    stale BlueZ cache entry without having to pair it first.  Unlike
+    ``/api/pairing/remove`` this does not touch the gateway config, so
+    it is safe to call on a device that was never a configured one.
+    """
+    addr = (address or "").strip().upper()
+    if not addr:
+        return jsonify({"error": "No address provided"}), 400
+    # If the device happened to be one of our SPP-connected ones, drop
+    # the app-side bookkeeping first so the read loop exits cleanly.
+    try:
+        current_app.device_server.disconnect_device(addr)
+    except Exception:
+        pass
+    ok = current_app.bt_manager.remove_device(addr, adapter_name=None)
+    try:
+        current_app.device_server.refresh_profiles()
+    except Exception:
+        pass
+    return jsonify({"status": "forgotten" if ok else "not_found",
+                    "address": addr})
 
 
 @bp.route("/api/pairing/remove", methods=["POST"])
@@ -316,6 +377,14 @@ def api_plc_discovered():
     adapter = current_app.gateway_config.get("plc_adapter", "")
     if not adapter:
         return jsonify([])
+    # If a PLC is already paired, make sure we're not still burning
+    # CPU on a leftover discovery session — the "single paired PLC"
+    # invariant means there's nothing useful left to find.
+    if current_app.bt_manager.get_single_paired_device(adapter):
+        try:
+            current_app.bt_manager.stop_discovery(adapter)
+        except Exception:
+            pass
     return jsonify(current_app.bt_manager.list_devices(adapter))
 
 

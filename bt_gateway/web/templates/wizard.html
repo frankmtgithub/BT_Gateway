@@ -101,7 +101,7 @@
             </div>
           </div>
 
-          <div class="d-flex gap-2 mb-3">
+          <div class="d-flex gap-2 mb-3 flex-wrap align-items-center">
             <button class="btn btn-success" id="wiz-plc-scan">
               <i class="bi bi-search"></i> Scan for PLC
             </button>
@@ -110,6 +110,21 @@
             </button>
             <span class="badge bg-secondary align-self-center fs-6"
                   id="wiz-plc-scan-badge">IDLE</span>
+            <div class="input-group input-group-sm ms-auto" style="max-width: 18rem;">
+              <span class="input-group-text" id="wiz-plc-filter-label">
+                <i class="bi bi-funnel"></i>
+              </span>
+              <input type="text" class="form-control"
+                     id="wiz-plc-filter"
+                     placeholder="Filter by name prefix…"
+                     aria-label="Filter PLCs by name prefix"
+                     aria-describedby="wiz-plc-filter-label">
+              <button class="btn btn-outline-secondary"
+                      type="button" id="wiz-plc-filter-clear"
+                      title="Clear filter">
+                <i class="bi bi-x"></i>
+              </button>
+            </div>
           </div>
           <div class="table-responsive">
             <table class="table table-sm table-hover mb-0">
@@ -146,7 +161,7 @@
             and a COM port automatically — you can change either later.
           </p>
 
-          <div class="d-flex gap-2 mb-3">
+          <div class="d-flex gap-2 mb-3 flex-wrap align-items-center">
             <button class="btn btn-success" id="wiz-dev-enable">
               <i class="bi bi-broadcast"></i> Enable Pairing
             </button>
@@ -155,6 +170,21 @@
             </button>
             <span class="badge bg-secondary align-self-center fs-6"
                   id="wiz-dev-badge">OFF</span>
+            <div class="input-group input-group-sm ms-auto" style="max-width: 18rem;">
+              <span class="input-group-text" id="wiz-dev-filter-label">
+                <i class="bi bi-funnel"></i>
+              </span>
+              <input type="text" class="form-control"
+                     id="wiz-dev-filter"
+                     placeholder="Filter by name prefix…"
+                     aria-label="Filter devices by name prefix"
+                     aria-describedby="wiz-dev-filter-label">
+              <button class="btn btn-outline-secondary"
+                      type="button" id="wiz-dev-filter-clear"
+                      title="Clear filter">
+                <i class="bi bi-x"></i>
+              </button>
+            </div>
           </div>
 
           <h6 class="mt-4">Discovered devices</h6>
@@ -247,12 +277,26 @@ document.addEventListener('DOMContentLoaded', function() {
   document.getElementById('wiz-plc-scan').addEventListener('click', startPlcScan);
   document.getElementById('wiz-plc-scan-stop').addEventListener('click', stopPlcScan);
   document.getElementById('wiz-plc-unpair').addEventListener('click', unpairPlc);
+  const wpFilter = document.getElementById('wiz-plc-filter');
+  if (wpFilter) wpFilter.addEventListener('input', renderPlcDiscovered);
+  const wpFilterClear = document.getElementById('wiz-plc-filter-clear');
+  if (wpFilterClear) wpFilterClear.addEventListener('click', function() {
+    wpFilter.value = '';
+    renderPlcDiscovered();
+  });
   document.getElementById('wiz-save-step2').addEventListener('click', saveStep2);
 
   // Step 3
   document.getElementById('wiz-dev-enable').addEventListener('click', enableDevPairing);
   document.getElementById('wiz-dev-disable').addEventListener('click', disableDevPairing);
   document.getElementById('wiz-save-step3').addEventListener('click', saveStep3);
+  const wdFilter = document.getElementById('wiz-dev-filter');
+  if (wdFilter) wdFilter.addEventListener('input', renderDevDiscovered);
+  const wdFilterClear = document.getElementById('wiz-dev-filter-clear');
+  if (wdFilterClear) wdFilterClear.addEventListener('click', function() {
+    wdFilter.value = '';
+    renderDevDiscovered();
+  });
 
   loadAdapters();
   loadCurrentSettings();
@@ -357,6 +401,7 @@ function refreshPlcStatus() {
   fetch('/api/plc/status').then(r => r.json()).then(data => {
     const disp = document.getElementById('wiz-plc-paired');
     const btn = document.getElementById('wiz-plc-unpair');
+    window._wizPlcPaired = !!data.paired;
     if (data.paired) {
       disp.textContent = data.paired.address +
         (data.paired.name ? ' (' + data.paired.name + ')' : '');
@@ -365,10 +410,20 @@ function refreshPlcStatus() {
       disp.textContent = '(none)';
       btn.classList.add('d-none');
     }
+    const scan = document.getElementById('wiz-plc-scan');
+    if (scan) scan.disabled = window._wizPlcPaired;
+    if (window._wizPlcPaired) {
+      const b = document.getElementById('wiz-plc-scan-badge');
+      if (b) { b.textContent = 'IDLE'; b.className = 'badge bg-secondary fs-6 align-self-center'; }
+    }
   });
 }
 
 function startPlcScan() {
+  if (window._wizPlcPaired) {
+    alert('A PLC is already paired on this adapter. Unpair it first to scan for a different one.');
+    return;
+  }
   fetch('/api/plc/discovery/start', {method: 'POST'}).then(r => r.json()).then(d => {
     if (d.error) { alert(d.error); return; }
     const b = document.getElementById('wiz-plc-scan-badge');
@@ -386,20 +441,64 @@ function stopPlcScan() {
 
 function refreshPlcDiscovered() {
   fetch('/api/plc/discovered').then(r => r.json()).then(devices => {
-    const tbody = document.getElementById('wiz-plc-discovered');
-    if (!devices.length) {
-      tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-3">No devices found yet.</td></tr>';
-      return;
+    window._wizPlcDiscovered = Array.isArray(devices) ? devices : [];
+    renderPlcDiscovered();
+  });
+}
+
+function renderPlcDiscovered() {
+  const tbody = document.getElementById('wiz-plc-discovered');
+  const devices = Array.isArray(window._wizPlcDiscovered) ? window._wizPlcDiscovered : [];
+  if (!devices.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-3">No devices found yet.</td></tr>';
+    return;
+  }
+  const filterEl = document.getElementById('wiz-plc-filter');
+  const filter = (filterEl && filterEl.value ? filterEl.value : '').trim().toLowerCase();
+  let sorted = devices;
+  if (filter) {
+    sorted = devices
+      .map((d, i) => ({ d: d, i: i,
+          match: (d.name || '').toLowerCase().startsWith(filter) }))
+      .sort((a, b) => {
+          if (a.match !== b.match) return a.match ? -1 : 1;
+          return a.i - b.i;
+      })
+      .map(x => x.d);
+  }
+  tbody.innerHTML = sorted.map(d => {
+    const matches = filter && (d.name || '').toLowerCase().startsWith(filter);
+    const rowCls = matches ? ' class="table-primary"' : '';
+    const addrAttr = String(d.address).replace(/'/g, '&#39;');
+    let primary;
+    if (d.paired) {
+      primary = '<em class="text-muted">already paired</em>';
+    } else if (window._wizPlcPaired) {
+      primary = '<em class="text-muted">another PLC is paired</em>';
+    } else {
+      primary = `<button class="btn btn-sm btn-outline-success" onclick="pairPlc('${addrAttr}')">Pair as PLC</button>`;
     }
-    tbody.innerHTML = devices.map(d => `
-      <tr>
+    const forget = `<button class="btn btn-sm btn-outline-danger ms-1" onclick="forgetWizDevice('${addrAttr}')" title="Force-remove from BlueZ on every adapter"><i class="bi bi-trash"></i> Forget</button>`;
+    return `
+      <tr${rowCls}>
         <td>${escHtml(d.name)}</td>
         <td class="font-monospace">${escHtml(d.address)}</td>
         <td>${d.paired ? '<span class="badge bg-success">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td>
-        <td>${d.paired ? '' : `<button class="btn btn-sm btn-outline-success" onclick="pairPlc('${d.address}')">Pair as PLC</button>`}</td>
+        <td>${primary}${forget}</td>
       </tr>
-    `).join('');
-  });
+    `;
+  }).join('');
+}
+
+function forgetWizDevice(address) {
+  if (!confirm('Force-remove ' + address + ' from BlueZ on every adapter?')) return;
+  fetch('/api/devices/' + encodeURIComponent(address) + '/forget',
+        {method: 'POST'})
+    .then(r => r.json())
+    .then(() => {
+      if (currentStep() === 2) { refreshPlcDiscovered(); refreshPlcStatus(); }
+      if (currentStep() === 3) { refreshDevDiscovered(); refreshDevPaired(); }
+    });
 }
 
 function pairPlc(address) {
@@ -451,20 +550,48 @@ function disableDevPairing() {
 
 function refreshDevDiscovered() {
   fetch('/api/pairing/devices').then(r => r.json()).then(devices => {
-    const tbody = document.getElementById('wiz-dev-discovered');
-    if (!devices.length) {
-      tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-3">No devices found yet.</td></tr>';
-      return;
-    }
-    tbody.innerHTML = devices.map(d => `
-      <tr>
+    window._wizDevDiscovered = Array.isArray(devices) ? devices : [];
+    renderDevDiscovered();
+  });
+}
+
+function renderDevDiscovered() {
+  const tbody = document.getElementById('wiz-dev-discovered');
+  const devices = Array.isArray(window._wizDevDiscovered) ? window._wizDevDiscovered : [];
+  if (!devices.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-3">No devices found yet.</td></tr>';
+    return;
+  }
+  const filterEl = document.getElementById('wiz-dev-filter');
+  const filter = (filterEl && filterEl.value ? filterEl.value : '').trim().toLowerCase();
+  let sorted = devices;
+  if (filter) {
+    sorted = devices
+      .map((d, i) => ({ d: d, i: i,
+          match: (d.name || '').toLowerCase().startsWith(filter) }))
+      .sort((a, b) => {
+          if (a.match !== b.match) return a.match ? -1 : 1;
+          return a.i - b.i;
+      })
+      .map(x => x.d);
+  }
+  tbody.innerHTML = sorted.map(d => {
+    const matches = filter && (d.name || '').toLowerCase().startsWith(filter);
+    const rowCls = matches ? ' class="table-primary"' : '';
+    const addrAttr = String(d.address).replace(/'/g, '&#39;');
+    const primary = d.paired
+      ? ''
+      : `<button class="btn btn-sm btn-outline-success" onclick="pairDev('${addrAttr}')">Pair</button>`;
+    const forget = `<button class="btn btn-sm btn-outline-danger ms-1" onclick="forgetWizDevice('${addrAttr}')" title="Force-remove from BlueZ on every adapter"><i class="bi bi-trash"></i> Forget</button>`;
+    return `
+      <tr${rowCls}>
         <td>${escHtml(d.name)}</td>
         <td class="font-monospace">${escHtml(d.address)}</td>
         <td>${d.paired ? '<span class="badge bg-success">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td>
-        <td>${d.paired ? '' : `<button class="btn btn-sm btn-outline-success" onclick="pairDev('${d.address}')">Pair</button>`}</td>
+        <td>${primary}${forget}</td>
       </tr>
-    `).join('');
-  });
+    `;
+  }).join('');
 }
 
 function pairDev(address) {

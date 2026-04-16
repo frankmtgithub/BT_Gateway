@@ -480,14 +480,18 @@ function renderDiscovered() {
         const pairedBadge = d.paired
             ? '<span class="badge bg-success">Yes</span>'
             : '<span class="badge bg-secondary">No</span>';
-        let actionCell;
+        const addrAttr = escAttr(d.address);
+        let primary;
         if (d.plc_paired) {
-            actionCell = '<span class="badge bg-warning text-dark" title="This device is paired on the PLC adapter — unpair it there before binding it as a device.">PLC — not usable here</span>';
+            primary = '<span class="badge bg-warning text-dark" title="This device is paired on the PLC adapter — unpair it there before binding it as a device.">PLC — not usable here</span>';
         } else if (d.paired) {
-            actionCell = '';
+            primary = '';
         } else {
-            actionCell = `<button class="btn btn-sm btn-outline-success" onclick="pairDevice('${escAttr(d.address)}')"><i class="bi bi-link"></i> Pair</button>`;
+            primary = `<button class="btn btn-sm btn-outline-success" onclick="pairDevice('${addrAttr}')"><i class="bi bi-link"></i> Pair</button>`;
         }
+        // Force-forget: wipe this address from BlueZ on every adapter so
+        // a stale cached device stops reappearing every scan round.
+        const forget = `<button class="btn btn-sm btn-outline-danger ms-1" onclick="forgetDevice('${addrAttr}')" title="Force-remove from BlueZ on every adapter"><i class="bi bi-trash"></i> Forget</button>`;
         // Highlight matching rows so the filter effect is obvious.
         const matches = filter && (d.name || '').toLowerCase().startsWith(filter);
         let rowCls = '';
@@ -498,10 +502,18 @@ function renderDiscovered() {
             <td>${escHtml(d.name)}</td>
             <td class="font-monospace">${escHtml(d.address)}</td>
             <td>${pairedBadge}</td>
-            <td>${actionCell}</td>
+            <td>${primary}${forget}</td>
         </tr>
     `;
     }).join('');
+}
+
+function forgetDevice(address) {
+    if (!confirm('Force-remove ' + address + ' from BlueZ on every adapter?')) return;
+    fetch('/api/devices/' + encodeURIComponent(address) + '/forget',
+          {method: 'POST'})
+        .then(r => r.json())
+        .then(() => { refreshDiscovered(); refreshPaired(); });
 }
 
 function refreshPaired() {
