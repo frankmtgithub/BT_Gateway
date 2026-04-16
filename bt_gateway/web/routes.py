@@ -1,11 +1,14 @@
 """Web routes and API endpoints for BT Gateway."""
 
+import datetime
 import logging
 import os
 import sys
 import threading
 
-from flask import Blueprint, current_app, jsonify, render_template, request
+from flask import (
+    Blueprint, Response, current_app, jsonify, render_template, request,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -478,7 +481,8 @@ def api_set_device_listen_channel(address):
 
     The scanner / remote Pi firmware is normally configured to hit a
     specific channel (the Windows "COM port" of the remote side), so each
-    device may want its own listen channel on the gateway.
+    device may want its own listen channel on the gateway.  Channel
+    uniqueness is enforced — two enabled devices cannot share a channel.
     """
     address = address.replace("-", ":").upper()
     data = request.get_json() or {}
@@ -488,10 +492,89 @@ def api_set_device_listen_channel(address):
         return jsonify({"error": "Invalid channel"}), 400
     if not current_app.gateway_config.set_device_listen_channel(address, channel):
         return jsonify({
-            "error": "Channel must be an integer between 1 and 30"
+            "error": ("Channel must be an integer between 1 and 30 and must "
+                      "not already be assigned to another enabled device.")
         }), 400
     current_app.device_server.refresh_profiles()
     return jsonify({"status": "ok", "listen_channel": channel})
+
+
+# ── HID → SPP handover API ──────────────────────────────────────────────────
+
+@bp.route("/api/devices/<address>/handover/start", methods=["POST"])
+def api_handover_start(address):
+    """Hold the scanner connected in HID mode while the SPP listener is
+    armed, so the user can scan the vendor 'switch to SPP' barcode on
+    a live ACL link and have the mode change land on us reliably.
+    """
+    address = address.replace("-", ":").upper()
+    if not current_app.device_server.start_handover(address):
+        return jsonify({"error": "Device is not paired on this adapter"}), 400
+    return jsonify({"status": "handover_started", "address": address})
+
+
+@bp.route("/api/devices/<address>/handover/stop", methods=["POST"])
+def api_handover_stop(address):
+    address = address.replace("-", ":").upper()
+    current_app.device_server.stop_handover(address, reason="user.cancel")
+    return jsonify({"status": "handover_stopped", "address": address})
+
+
+@bp.route("/api/handover/active")
+def api_handover_active():
+    return jsonify({
+        "addresses": current_app.device_server.active_handovers,
+    })
+
+
+# ── Connection log API ──────────────────────────────────────────────────────
+
+@bp.route("/api/connection-log")
+def api_connection_log():
+    """Return the recent connection-log entries as JSON.
+
+    Query params:
+        address — filter to a single BT MAC (case-insensitive)
+        limit   — cap on number of entries returned (most recent)
+    """
+    clog = getattr(current_app, "conn_log", None)
+    if clog is None:
+        return jsonify({"entries": []})
+    address = request.args.get("address", "").strip()
+    limit_raw = request.args.get("limit", "").strip()
+    limit = None
+    if limit_raw:
+        try:
+            limit = max(1, min(10000, int(limit_raw)))
+        except ValueError:
+            limit = None
+    return jsonify({"entries": clog.entries(address=address or None,
+                                            limit=limit)})
+
+
+@bp.route("/api/connection-log/download")
+def api_connection_log_download():
+    """Download the connection log as a plain-text attachment."""
+    clog = getattr(current_app, "conn_log", None)
+    body = clog.to_text() if clog is not None else "(no connection log)\n"
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y%m%dT%H%M%SZ"
+    )
+    filename = f"bt-gateway-connection-log-{stamp}.txt"
+    return Response(
+        body,
+        mimetype="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+        },
+    )
+
+
+@bp.route("/api/connection-log/clear", methods=["POST"])
+def api_connection_log_clear():
+    clog = getattr(current_app, "conn_log", None)
+    cleared = clog.clear() if clog is not None else 0
+    return jsonify({"status": "ok", "cleared": cleared})
 
 
 # ── Restart (for wizard adapter re-selection) ───────────────────────────────

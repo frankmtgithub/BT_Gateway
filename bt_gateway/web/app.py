@@ -10,7 +10,8 @@ logger = logging.getLogger(__name__)
 socketio = SocketIO()
 
 
-def create_app(config, bt_manager, router, plc_connection, device_server):
+def create_app(config, bt_manager, router, plc_connection, device_server,
+               conn_log=None):
     """Create and configure the Flask application.
 
     All gateway components are stored on the app object so routes can
@@ -29,6 +30,7 @@ def create_app(config, bt_manager, router, plc_connection, device_server):
     app.router = router
     app.plc_connection = plc_connection
     app.device_server = device_server
+    app.conn_log = conn_log
 
     # Register routes
     from bt_gateway.web.routes import bp

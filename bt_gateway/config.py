@@ -258,8 +258,10 @@ class Config:
     def set_device_listen_channel(self, address, channel):
         """Change the RFCOMM channel we advertise SPP on for this device.
 
-        Returns True on success, False if the device is unknown or the
-        channel is out of range (1-30).
+        Returns True on success, False if the device is unknown, the
+        channel is out of range (1-30), or the channel is already
+        claimed by another enabled paired device.  Channel ownership is
+        exclusive so that a scanner can only land on its own listener.
         """
         try:
             channel = int(channel)
@@ -270,6 +272,21 @@ class Config:
         with self._lock:
             if address not in self._data["devices"]:
                 return False
+            # Reject duplicates: another enabled device already listens on
+            # this channel.  Disabled devices don't block the slot because
+            # their listener isn't active.
+            for other_addr, other_dev in self._data["devices"].items():
+                if other_addr == address:
+                    continue
+                if not other_dev.get("enabled", True):
+                    continue
+                if int(other_dev.get("listen_channel") or 0) == channel:
+                    logger.warning(
+                        "Refused listen_channel=%d for %s — already "
+                        "owned by %s",
+                        channel, address, other_addr,
+                    )
+                    return False
             self._data["devices"][address]["listen_channel"] = channel
             self._save_unlocked()
             logger.info("Device %s listen_channel=%d", address, channel)

@@ -22,6 +22,7 @@ logger = logging.getLogger("bt_gateway")
 
 from bt_gateway.config import Config
 from bt_gateway.bt_manager import BluetoothManager
+from bt_gateway.connection_log import ConnectionLog
 from bt_gateway.message_router import MessageRouter
 from bt_gateway.plc_connection import PLCConnection
 from bt_gateway.device_server import DeviceServer
@@ -36,19 +37,25 @@ def main():
     # ── Initialise components ────────────────────────────────────────────
     config = Config(config_path)
 
-    bt_manager = BluetoothManager()
+    # Shared connection log — instrumented by every piece of the
+    # scanner/SPP path so the UI can show a full trace.
+    conn_log = ConnectionLog(socketio=socketio)
+    conn_log.info("gateway.boot", "BT Gateway starting")
+
+    bt_manager = BluetoothManager(conn_log=conn_log)
     bt_manager.start()
 
     # Register the pairing agent so the gateway can accept PIN/passkey
     # requests automatically (both PLC pairing and device pairing).
-    pairing_agent = register_agent(bt_manager.bus)
+    pairing_agent = register_agent(bt_manager.bus, conn_log=conn_log)
 
     router = MessageRouter(config, socketio)
 
     plc_conn = PLCConnection(config, router, bt_manager, socketio)
     router.set_plc_connection(plc_conn)
 
-    device_server = DeviceServer(config, router, bt_manager, socketio)
+    device_server = DeviceServer(config, router, bt_manager, socketio,
+                                 conn_log=conn_log)
 
     # ── Power on adapters ────────────────────────────────────────────────
     plc_adapter = config.get("plc_adapter")
@@ -68,7 +75,8 @@ def main():
     device_server.start()
 
     # ── Create Flask app ─────────────────────────────────────────────────
-    app = create_app(config, bt_manager, router, plc_conn, device_server)
+    app = create_app(config, bt_manager, router, plc_conn, device_server,
+                     conn_log=conn_log)
 
     # ── Graceful shutdown ────────────────────────────────────────────────
     def shutdown(sig, frame):

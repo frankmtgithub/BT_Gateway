@@ -16,6 +16,21 @@ from gi.repository import GLib
 
 SPP_UUID_SHORT = "1101"
 SPP_UUID = "00001101-0000-1000-8000-00805f9b34fb"
+HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
+
+_UUID_LABELS = {
+    SPP_UUID: "SPP",
+    HID_UUID: "HID",
+    "0000110a-0000-1000-8000-00805f9b34fb": "A2DP-Source",
+    "0000110b-0000-1000-8000-00805f9b34fb": "A2DP-Sink",
+    "0000111e-0000-1000-8000-00805f9b34fb": "Handsfree",
+    "00001108-0000-1000-8000-00805f9b34fb": "Headset",
+}
+
+
+def _uuid_label(uuid):
+    """Return a short human-friendly label for a Bluetooth service UUID."""
+    return _UUID_LABELS.get(str(uuid).lower(), str(uuid))
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +44,21 @@ OM_IFACE = "org.freedesktop.DBus.ObjectManager"
 class BluetoothManager:
     """Manages BlueZ adapters, discovery, and pairing via D-Bus."""
 
-    def __init__(self):
+    def __init__(self, conn_log=None):
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
         self._bus = dbus.SystemBus()
         self._loop = GLib.MainLoop()
         self._loop_thread = None
         self._discovering = False
         self._discovery_adapter_path = None
+        # Optional connection log — instrumented so the UI can show every
+        # low-level BlueZ step during a connection attempt.
+        self._conn_log = conn_log
+
+    def _clog(self, level, step, detail, **kw):
+        if self._conn_log is None:
+            return
+        getattr(self._conn_log, level)(step, detail, **kw)
 
     def start(self):
         """Start the GLib main loop in a background thread for D-Bus signals."""
@@ -182,9 +205,15 @@ class BluetoothManager:
 
     def pair_device(self, device_address, adapter_name=None):
         """Initiate pairing with a device by its BT address."""
+        self._clog("info", "pair.start",
+                   f"Pairing {device_address} on {adapter_name or '(default)'}",
+                   address=device_address)
         device_path = self._find_device_path(device_address, adapter_name)
         if not device_path:
             logger.error("Device %s not found", device_address)
+            self._clog("error", "pair.not_found",
+                       f"Device {device_address} not present in BlueZ — "
+                       "discovery still running?", address=device_address)
             return False
         try:
             device = dbus.Interface(
@@ -197,9 +226,86 @@ class BluetoothManager:
             )
             props.Set(DEVICE_IFACE, "Trusted", dbus.Boolean(True))
             logger.info("Paired and trusted device %s", device_address)
+            self._clog("info", "pair.ok",
+                       f"Paired and trusted {device_address}",
+                       address=device_address)
             return True
         except dbus.DBusException as e:
             logger.error("Failed to pair with %s: %s", device_address, e)
+            self._clog("error", "pair.fail",
+                       f"BlueZ pair failed for {device_address}: {e}",
+                       address=device_address)
+            return False
+
+    def connect_device(self, device_address, adapter_name=None):
+        """Bring the ACL link up via BlueZ ``Device1.Connect``.
+
+        Unlike :meth:`connect_profile`, this tells BlueZ "connect every
+        profile you know how to".  For a scanner in HID mode that
+        brings up HID and keeps the ACL link alive — which is exactly
+        the state we need while the user scans the "switch to SPP"
+        barcode, because a mode change on a live ACL link reconnects
+        faster and more reliably than one on an idle link.
+        """
+        device_path = self._find_device_path(device_address, adapter_name)
+        if not device_path:
+            self._clog("error", "device.connect.not_found",
+                       f"Device {device_address} not in BlueZ",
+                       address=device_address)
+            return False
+        try:
+            device = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, device_path), DEVICE_IFACE
+            )
+            device.Connect()
+            self._clog("info", "device.connect.ok",
+                       f"Device1.Connect succeeded on {device_address}",
+                       address=device_address)
+            return True
+        except dbus.DBusException as e:
+            # Already-connected is not an error for us — the link is up.
+            msg = str(e)
+            if "Already Connected" in msg or "AlreadyConnected" in msg:
+                self._clog("info", "device.connect.already",
+                           f"{device_address} already connected",
+                           address=device_address)
+                return True
+            self._clog("warn", "device.connect.fail",
+                       f"Device1.Connect failed on {device_address}: {msg}",
+                       address=device_address)
+            return False
+
+    def disconnect_device(self, device_address, adapter_name=None):
+        """Tear down the whole ACL link to a device (all profiles)."""
+        device_path = self._find_device_path(device_address, adapter_name)
+        if not device_path:
+            return False
+        try:
+            device = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, device_path), DEVICE_IFACE
+            )
+            device.Disconnect()
+            self._clog("info", "device.disconnect.ok",
+                       f"Disconnected {device_address} (full ACL)",
+                       address=device_address)
+            return True
+        except dbus.DBusException as e:
+            self._clog("warn", "device.disconnect.fail",
+                       f"Device1.Disconnect failed on {device_address}: {e}",
+                       address=device_address)
+            return False
+
+    def is_device_connected(self, device_address, adapter_name=None):
+        """Return True if BlueZ currently reports the device as connected."""
+        device_path = self._find_device_path(device_address, adapter_name)
+        if not device_path:
+            return False
+        try:
+            props = dbus.Interface(
+                self._bus.get_object(BLUEZ_SERVICE, device_path), PROPS_IFACE
+            )
+            return bool(props.Get(DEVICE_IFACE, "Connected"))
+        except dbus.DBusException:
             return False
 
     def connect_profile(self, device_address, uuid, adapter_name=None):
@@ -220,10 +326,17 @@ class BluetoothManager:
             )
             device.ConnectProfile(uuid)
             logger.info("ConnectProfile(%s) on %s", uuid, device_address)
+            self._clog("info", "profile.connect.ok",
+                       f"ConnectProfile({_uuid_label(uuid)}) on {device_address}",
+                       address=device_address, uuid=str(uuid))
             return True
         except dbus.DBusException as e:
             logger.warning("ConnectProfile(%s) on %s failed: %s",
                            uuid, device_address, e)
+            self._clog("warn", "profile.connect.fail",
+                       f"ConnectProfile({_uuid_label(uuid)}) on {device_address} "
+                       f"failed: {e}",
+                       address=device_address, uuid=str(uuid))
             return False
 
     def disconnect_profile(self, device_address, uuid, adapter_name=None):
@@ -238,10 +351,17 @@ class BluetoothManager:
             )
             device.DisconnectProfile(uuid)
             logger.info("DisconnectProfile(%s) on %s", uuid, device_address)
+            self._clog("info", "profile.disconnect.ok",
+                       f"DisconnectProfile({_uuid_label(uuid)}) on {device_address}",
+                       address=device_address, uuid=str(uuid))
             return True
         except dbus.DBusException as e:
             logger.warning("DisconnectProfile(%s) on %s failed: %s",
                            uuid, device_address, e)
+            self._clog("debug", "profile.disconnect.fail",
+                       f"DisconnectProfile({_uuid_label(uuid)}) on {device_address} "
+                       f"failed: {e}",
+                       address=device_address, uuid=str(uuid))
             return False
 
     def set_device_trusted(self, device_address, trusted=True, adapter_name=None):
