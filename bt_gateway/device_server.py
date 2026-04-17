@@ -428,16 +428,6 @@ class _DeviceLink:
             self._schedule_retry()
             return None, channel
 
-        if not rfcomm_tty.tty_exists(self._port):
-            self._clog("error", "rfcomm.tty_missing",
-                       f"rfcomm bind succeeded but /dev/rfcomm"
-                       f"{self._port} does not exist.  If running "
-                       "under Docker, mount the host's /dev into the "
-                       "container (add '- /dev:/dev' to volumes).",
-                       address=self.address, channel=channel)
-            self._schedule_retry()
-            return None, channel
-
         try:
             self._bt_manager.set_device_trusted(
                 self.address, True, self._adapter_name,

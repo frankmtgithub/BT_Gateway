@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,25 @@ def bind(port, address, channel, adapter=None):
             result.stderr.strip(),
         )
         return False
+
+    # The ``rfcomm bind`` call returns the moment the kernel has accepted
+    # the binding, but the ``/dev/rfcomm<N>`` node is created a tick
+    # later by devtmpfs / udev.  In Docker with ``/dev`` bind-mounted
+    # from the host that propagation can take noticeably longer than
+    # on bare metal, and if we just released the same port a moment
+    # ago it's even slower.  Poll briefly so callers can rely on the
+    # TTY actually being usable when we return True.
+    deadline = time.monotonic() + 2.0
+    while not tty_exists(port):
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "rfcomm bind %d %s %d (adapter=%s): TTY node "
+                "/dev/rfcomm%d did not appear within 2s",
+                port, address, channel, adapter or "default", port,
+            )
+            return False
+        time.sleep(0.05)
+
     logger.info("Bound /dev/rfcomm%d → %s channel %d via %s",
                 port, address, channel, adapter or "default adapter")
     return True
