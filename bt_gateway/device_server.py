@@ -1,34 +1,43 @@
-"""Device-side gateway: one outbound RFCOMM client per paired scanner.
+"""Device-side gateway: hybrid RFCOMM client / server per paired scanner.
 
-Mirrors :mod:`bt_gateway.plc_connection` on the devices side.  For every
-enabled paired scanner we run a dedicated manager thread that
+Scanners ship in two very different SPP personalities:
 
-1. binds ``/dev/rfcomm<N>`` to the scanner's BT address + RFCOMM channel,
-   and
-2. opens that TTY — which is what actually triggers the kernel to dial
-   the scanner over RFCOMM (exactly the way Hercules opening COM6 on
-   Windows triggers Windows's BT stack to dial the remote SPP server).
+* **SPP Slave** (registers an SDP SerialPort record): the host dials out
+  to the scanner on its advertised channel.
+* **SPP Master / Cradle** (no SDP record, scanner initiates): the host
+  listens on an SPP channel and the scanner dials in whenever a barcode
+  is triggered.
 
-While the TTY is open we read lines off it and push them to the router;
-when the link drops the manager releases the TTY fd, waits a backoff
-interval, and tries again.  Scanners that are still in HID-only mode
-(post-pair, pre-barcode-switch) just fail to dial and get retried quietly
-until the operator scans the vendor "switch to SPP" setup barcode.
+We don't know which mode a given scanner is in until it actually
+connects, so each enabled device gets a :class:`_DeviceLink` that
 
-This replaces the old Profile1 / ``NewConnection`` server path.  The Pi
-is now the RFCOMM *client* for both the PLC and the scanners; the only
-difference is that the PLC is one device on the PLC adapter, while the
-scanners are N devices on the devices adapter.
+1. binds ``/dev/rfcomm<N>`` to the scanner's BT address + RFCOMM channel
+   and tries to **dial out** by opening the TTY (same path Hercules uses
+   on Windows when it opens an outgoing COM port), and in parallel
+2. is wired into a shared :class:`_SPPListener` that **accepts inbound**
+   RFCOMM connections on the scanner's configured channel and routes
+   them back to the right link by peer address.
+
+Whichever path succeeds first wins.  The read loop is the same either
+way — ``os.read`` on the fd, split on newlines, push to the router.
 """
 
 import logging
 import os
+import queue
+import socket
 import termios
 import threading
 import time
 import tty
 
 from bt_gateway import rfcomm_tty
+
+try:
+    from socket import AF_BLUETOOTH, BTPROTO_RFCOMM
+except ImportError:
+    AF_BLUETOOTH = 31
+    BTPROTO_RFCOMM = 3
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +67,131 @@ READ_TIMEOUT = 1.0
 DEFAULT_PAIR_GUARD_SECONDS = 90.0
 
 
-class _DeviceLink:
-    """One outbound RFCOMM-over-TTY connection to a single scanner.
+class _SPPListener:
+    """Accepts inbound RFCOMM connections on one channel of the devices
+    adapter and dispatches each accepted socket by peer BT address.
 
-    Owns the lifetime of ``/dev/rfcomm<port>`` for this device: binds it
-    on start, opens it in a loop (dialing), reads lines, notifies the
-    router, and releases the binding on stop.
+    One listener is shared across every enabled scanner that uses the
+    same ``listen_channel``.  When a scanner dials in, :meth:`_run`
+    picks it up via ``accept()`` and calls the registered dispatch
+    callback, which looks up the owning :class:`_DeviceLink` and hands
+    the socket over.
+    """
+
+    def __init__(self, adapter_address, channel, dispatch, conn_log=None):
+        self._adapter_address = (adapter_address or "").upper()
+        self._channel = int(channel)
+        self._dispatch = dispatch
+        self._conn_log = conn_log
+        self._sock = None
+        self._thread = None
+        self._running = False
+
+    @property
+    def channel(self):
+        return self._channel
+
+    def start(self):
+        try:
+            sock = socket.socket(AF_BLUETOOTH, socket.SOCK_STREAM,
+                                 BTPROTO_RFCOMM)
+            bind_addr = self._adapter_address or "00:00:00:00:00:00"
+            sock.bind((bind_addr, self._channel))
+            sock.listen(4)
+        except OSError as e:
+            logger.error("RFCOMM listen on ch%d failed: %s",
+                         self._channel, e)
+            self._clog("warn", "listener.start_fail",
+                       f"Cannot listen on RFCOMM channel {self._channel}: "
+                       f"{e}.  Incoming scanner connections won't be "
+                       "accepted on this channel.",
+                       channel=self._channel)
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return False
+
+        self._sock = sock
+        self._running = True
+        self._clog("info", "listener.start",
+                   f"Listening for inbound SPP on channel "
+                   f"{self._channel} (devices adapter)",
+                   channel=self._channel)
+        self._thread = threading.Thread(
+            target=self._run, daemon=True,
+            name=f"spp-listen-ch{self._channel}",
+        )
+        self._thread.start()
+        return True
+
+    def stop(self):
+        self._running = False
+        sock = self._sock
+        self._sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if self._thread:
+            self._thread.join(timeout=3)
+            self._thread = None
+        self._clog("info", "listener.stop",
+                   f"Stopped listening on channel {self._channel}",
+                   channel=self._channel)
+
+    def _run(self):
+        sock = self._sock
+        while self._running and sock is not None:
+            try:
+                client, addr = sock.accept()
+            except OSError:
+                if self._running:
+                    logger.exception(
+                        "accept() on RFCOMM ch%d failed", self._channel)
+                break
+
+            peer = (addr[0] if addr else "").upper()
+            self._clog("info", "listener.accept",
+                       f"Inbound SPP from {peer} on channel "
+                       f"{self._channel}",
+                       address=peer, channel=self._channel)
+
+            try:
+                self._dispatch(peer, client, self._channel)
+            except Exception:
+                logger.exception("dispatch failed for %s", peer)
+                try:
+                    client.close()
+                except OSError:
+                    pass
+
+    def _clog(self, level, step, detail, **kw):
+        if self._conn_log is None:
+            return
+        getattr(self._conn_log, level)(step, detail, **kw)
+
+
+class _DeviceLink:
+    """One bidirectional RFCOMM link per enabled scanner.
+
+    Can come up either way:
+
+    * **Dial-out** — binds ``/dev/rfcomm<port>`` and opens it in a
+      worker thread (Linux equivalent of Windows opening an outgoing
+      COM port).  Works for scanners in SPP Slave mode.
+    * **Listen-accept** — a shared :class:`_SPPListener` accepts an
+      incoming connection and hands the socket back via
+      :meth:`offer_inbound`.  Works for scanners in SPP Master / Cradle
+      mode.
+
+    Whichever arrives first wins; the other path backs off until the
+    current link drops.
     """
 
     def __init__(self, address, port, channel, adapter_name,
@@ -80,6 +208,14 @@ class _DeviceLink:
 
         self._fd = None
         self._fd_lock = threading.Lock()
+        # When the current link came in via the listener, we hold the
+        # Python socket here to keep it alive for the duration of the
+        # link (and to close it cleanly on drop).  None when the link
+        # came in via dial-out / no link is up.
+        self._inbound_sock = None
+        # Queue of sockets offered by the shared _SPPListener.  _run
+        # pops from this before attempting another dial.
+        self._inbound_queue = queue.Queue()
         self._thread = None
         self._running = False
         self._registered = False
@@ -102,6 +238,8 @@ class _DeviceLink:
     def stop(self):
         self._running = False
         self._close_fd()
+        self._close_inbound_sock()
+        self._drain_inbound_queue()
         rfcomm_tty.release(self._port)
         if self._thread:
             self._thread.join(timeout=3)
@@ -139,118 +277,179 @@ class _DeviceLink:
     # ── Main loop ──────────────────────────────────────────────────────
 
     def _run(self):
-        # Discover the scanner's actual SPP channel once before we start
-        # dialing.  The per-device listen_channel in config is used only
-        # as an override when SDP fails.
         resolved_channel = self._resolve_channel()
         if not resolved_channel:
             self._clog("warn", "device.dial.no_channel",
                        f"{self.address}: no SPP channel known yet, will "
-                       "keep retrying.  Switch the scanner to SPP mode.",
+                       "keep retrying / listening.  Switch the scanner "
+                       "to SPP mode.",
                        address=self.address)
 
         while self._running:
-            now = time.monotonic()
-            if now < self._next_attempt:
-                time.sleep(min(1.0, self._next_attempt - now))
+            # Absorb an inbound connection that landed since we last
+            # looked.  Non-blocking — we only want to short-circuit the
+            # dial if one's already waiting.
+            sock = self._pop_inbound_nowait()
+            if sock is not None:
+                self._serve(sock=sock, source="listen",
+                            channel=resolved_channel or self._channel)
                 continue
 
-            # If the scanner has been set to pair-guard or disabled mid-run,
-            # the outer DeviceServer will have called stop() on us already.
+            # Respect the dial backoff, but keep an ear open for an
+            # inbound connection during the wait — that's the whole
+            # point of the hybrid.
+            wait = self._next_attempt - time.monotonic()
+            if wait > 0:
+                sock = self._pop_inbound(timeout=min(wait, 2.0))
+                if sock is not None:
+                    self._serve(sock=sock, source="listen",
+                                channel=resolved_channel or self._channel)
+                continue
+
             channel = resolved_channel or self._channel
-            if not channel:
-                # Keep probing SDP in case the scanner finally advertises
-                # SPP (firmware mode change), but do it slowly.
-                self._schedule_retry()
-                continue
-
-            # Make sure the TTY binding matches our target and exists.
-            if not rfcomm_tty.bind(self._port, self.address, channel):
-                self._clog("warn", "rfcomm.bind_fail",
-                           f"rfcomm bind /dev/rfcomm{self._port} → "
-                           f"{self.address} ch{channel} failed",
-                           address=self.address, channel=channel)
-                self._schedule_retry()
-                continue
-
-            # `rfcomm bind` reports success at the kernel level even when
-            # the resulting /dev node is invisible to us — this happens
-            # inside a Docker container whose /dev tmpfs is not
-            # bind-mounted from the host.  Surface it clearly instead of
-            # letting the operator chase cryptic ENOENT errors on open().
-            if not rfcomm_tty.tty_exists(self._port):
-                self._clog("error", "rfcomm.tty_missing",
-                           f"rfcomm bind succeeded but /dev/rfcomm"
-                           f"{self._port} does not exist.  If running "
-                           "under Docker, mount the host's /dev into the "
-                           "container (add '- /dev:/dev' to volumes).",
-                           address=self.address, channel=channel)
-                self._schedule_retry()
-                continue
-
-            # Trust the device so BlueZ doesn't pop an authorisation prompt
-            # on every dial.
-            try:
-                self._bt_manager.set_device_trusted(
-                    self.address, True, self._adapter_name,
-                )
-            except Exception:
-                pass
-
-            self._clog("info", "device.dial",
-                       f"Dialing /dev/rfcomm{self._port} → {self.address} "
-                       f"ch{channel}",
-                       address=self.address, channel=channel)
-
-            fd = self._open_tty()
+            fd, out_channel = self._attempt_dial(channel)
             if fd is None:
-                # Dial failed — scanner asleep, out of range, or still in
-                # HID-only mode.  Back off and retry.
-                self._register_failure(channel)
                 continue
 
-            # Dial succeeded — we have a live RFCOMM link.
-            self._fail_count = 0
-            self._next_attempt = 0.0
-            with self._fd_lock:
-                self._fd = fd
-
-            self._register_with_router()
-            self._clog("info", "device.connected",
-                       f"{self.address} connected on /dev/rfcomm{self._port} "
-                       f"(channel {channel})",
-                       address=self.address, channel=channel)
-            self._emit_connected()
-
-            # Opportunistic: a scanner that just accepted SPP often still
-            # has a dangling HID profile from pairing.  Drop it so the Pi
-            # doesn't also receive scans as keystrokes.
-            try:
-                self._bt_manager.disconnect_profile(
-                    self.address, HID_UUID, self._adapter_name,
-                )
-            except Exception:
-                pass
-
-            try:
-                self._read_loop(fd)
-            finally:
-                self._close_fd()
-                self._unregister_from_router()
-                self._emit_disconnected()
-                self._clog("info", "device.disconnected",
-                           f"{self.address} disconnected "
-                           f"from /dev/rfcomm{self._port}",
-                           address=self.address, channel=channel)
-
-            # Brief pause before redialing so we don't spin on a flapping
-            # link.  If the link was healthy and just closed we reconnect
-            # quickly; repeated failures will re-escalate the backoff.
-            if self._running:
-                time.sleep(1.0)
+            self._serve(fd=fd, source="dial", channel=out_channel)
 
         # Clean exit.
         rfcomm_tty.release(self._port)
+
+    # ── Inbound queue helpers ──────────────────────────────────────────
+
+    def offer_inbound(self, sock):
+        """Called from the listener thread when a scanner dials into us
+        on this device's channel.  If we already have a live link we
+        reject the duplicate; otherwise we enqueue the socket for
+        :meth:`_run` to pick up."""
+        with self._fd_lock:
+            busy = self._fd is not None
+        if busy or not self._running:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return False
+        self._inbound_queue.put(sock)
+        return True
+
+    def _pop_inbound_nowait(self):
+        try:
+            return self._inbound_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _pop_inbound(self, timeout):
+        try:
+            return self._inbound_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def _drain_inbound_queue(self):
+        while True:
+            s = self._pop_inbound_nowait()
+            if s is None:
+                return
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    # ── Dial path ──────────────────────────────────────────────────────
+
+    def _attempt_dial(self, channel):
+        """Run one dial-out attempt.  Returns ``(fd, channel)`` on
+        success, ``(None, channel)`` on failure (with backoff already
+        scheduled)."""
+        if not channel:
+            self._schedule_retry()
+            return None, channel
+
+        if not rfcomm_tty.bind(self._port, self.address, channel):
+            self._clog("warn", "rfcomm.bind_fail",
+                       f"rfcomm bind /dev/rfcomm{self._port} → "
+                       f"{self.address} ch{channel} failed",
+                       address=self.address, channel=channel)
+            self._schedule_retry()
+            return None, channel
+
+        if not rfcomm_tty.tty_exists(self._port):
+            self._clog("error", "rfcomm.tty_missing",
+                       f"rfcomm bind succeeded but /dev/rfcomm"
+                       f"{self._port} does not exist.  If running "
+                       "under Docker, mount the host's /dev into the "
+                       "container (add '- /dev:/dev' to volumes).",
+                       address=self.address, channel=channel)
+            self._schedule_retry()
+            return None, channel
+
+        try:
+            self._bt_manager.set_device_trusted(
+                self.address, True, self._adapter_name,
+            )
+        except Exception:
+            pass
+
+        self._clog("info", "device.dial",
+                   f"Dialing /dev/rfcomm{self._port} → {self.address} "
+                   f"ch{channel}",
+                   address=self.address, channel=channel)
+
+        fd = self._open_tty()
+        if fd is None:
+            self._register_failure(channel)
+            return None, channel
+        return fd, channel
+
+    # ── Common serve path (works for TTY fd or inbound socket) ─────────
+
+    def _serve(self, *, fd=None, sock=None, source, channel):
+        """Take ownership of a freshly-established link and drive its
+        read loop until it drops."""
+        if sock is not None:
+            fd = sock.fileno()
+            self._inbound_sock = sock
+            detail = (f"{self.address} accepted inbound SPP on channel "
+                      f"{channel}")
+        else:
+            self._inbound_sock = None
+            detail = (f"{self.address} connected on /dev/rfcomm"
+                      f"{self._port} (channel {channel})")
+
+        self._fail_count = 0
+        self._next_attempt = 0.0
+        with self._fd_lock:
+            self._fd = fd
+
+        self._register_with_router()
+        self._clog("info", "device.connected", detail,
+                   address=self.address, channel=channel)
+        self._emit_connected()
+
+        try:
+            self._bt_manager.disconnect_profile(
+                self.address, HID_UUID, self._adapter_name,
+            )
+        except Exception:
+            pass
+
+        try:
+            self._read_loop(fd)
+        finally:
+            self._close_fd()
+            self._unregister_from_router()
+            self._emit_disconnected()
+            self._clog("info", "device.disconnected",
+                       f"{self.address} disconnected "
+                       f"({source}, channel {channel})",
+                       address=self.address, channel=channel)
+            # A queued-but-stale inbound is no good once the current
+            # link drops — the scanner will redial if it wants.
+            self._drain_inbound_queue()
+
+        if self._running:
+            time.sleep(1.0)
 
     def _resolve_channel(self):
         """Return the RFCOMM channel to dial on the scanner.
@@ -384,9 +583,37 @@ class _DeviceLink:
         with self._fd_lock:
             fd = self._fd
             self._fd = None
+            sock = self._inbound_sock
+            self._inbound_sock = None
+        if sock is not None:
+            # Closing the socket releases the same fd, so skip the
+            # os.close() below for this case.
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return
         if fd is not None:
             try:
                 os.close(fd)
+            except OSError:
+                pass
+
+    def _close_inbound_sock(self):
+        with self._fd_lock:
+            sock = self._inbound_sock
+            self._inbound_sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
             except OSError:
                 pass
 
@@ -470,6 +697,11 @@ class DeviceServer:
         self._conn_log = conn_log
         # BT address -> _DeviceLink
         self._links = {}
+        # RFCOMM channel -> _SPPListener (shared across every link on
+        # that channel; an SPP-Master scanner dials in and we route by
+        # peer BT address).
+        self._listeners = {}
+        self._adapter_address = None
         self._lock = threading.Lock()
         self._pairing_mode = False
         self._started = False
@@ -504,6 +736,16 @@ class DeviceServer:
         rfcomm_tty.release_all()
 
         self._bt_manager.power_adapter(adapter_name, True)
+        self._adapter_address = self._resolve_adapter_address(adapter_name)
+        if self._adapter_address:
+            self._clog("info", "device.adapter",
+                       f"Devices adapter {adapter_name} = "
+                       f"{self._adapter_address}")
+        else:
+            self._clog("warn", "device.adapter.unknown",
+                       f"Could not resolve BT address of devices adapter "
+                       f"{adapter_name}; inbound SPP listener will bind "
+                       "to ANY adapter")
         self._started = True
         self.refresh_managers()
         return True
@@ -511,8 +753,26 @@ class DeviceServer:
     def stop(self):
         self._started = False
         self.disconnect_all()
+        self._stop_all_listeners()
         self.set_pairing_mode(False)
         rfcomm_tty.release_all()
+
+    def _resolve_adapter_address(self, adapter_name):
+        """Resolve an adapter name (e.g. hci1) to its BT address."""
+        try:
+            addr = self._bt_manager.get_adapter_address(adapter_name)
+            if addr:
+                return addr.upper()
+        except Exception:
+            pass
+        try:
+            path = f"/sys/class/bluetooth/{adapter_name}/address"
+            if os.path.exists(path):
+                with open(path) as f:
+                    return f.read().strip().upper()
+        except OSError:
+            pass
+        return None
 
     # ── Manager set ────────────────────────────────────────────────────
 
@@ -560,6 +820,78 @@ class DeviceServer:
             if already:
                 continue
             self._start_link(addr, port, channel, adapter_name)
+
+        # Line up listeners with whatever channels the current set of
+        # links actually cares about.
+        self._refresh_listeners(desired)
+
+    # ── Inbound SPP listeners ──────────────────────────────────────────
+
+    def _refresh_listeners(self, desired):
+        """Start an :class:`_SPPListener` for every RFCOMM channel used by
+        an enabled scanner, and tear down listeners for channels no
+        longer in use."""
+        wanted = {channel for _, channel in desired.values() if channel}
+
+        with self._lock:
+            current = set(self._listeners.keys())
+
+        # Stop listeners no longer needed.
+        for ch in current - wanted:
+            self._stop_listener(ch)
+
+        # Start listeners for new channels.
+        for ch in wanted - current:
+            self._start_listener(ch)
+
+    def _start_listener(self, channel):
+        listener = _SPPListener(
+            adapter_address=self._adapter_address,
+            channel=channel,
+            dispatch=self._dispatch_incoming,
+            conn_log=self._conn_log,
+        )
+        if not listener.start():
+            return
+        with self._lock:
+            self._listeners[int(channel)] = listener
+
+    def _stop_listener(self, channel):
+        with self._lock:
+            listener = self._listeners.pop(int(channel), None)
+        if listener is not None:
+            listener.stop()
+
+    def _stop_all_listeners(self):
+        with self._lock:
+            channels = list(self._listeners.keys())
+        for ch in channels:
+            self._stop_listener(ch)
+
+    def _dispatch_incoming(self, peer_addr, sock, channel):
+        """Callback from :class:`_SPPListener`: route a freshly-accepted
+        RFCOMM socket to the matching :class:`_DeviceLink`.  If no link
+        owns this peer (unpaired / disabled device), we close the socket
+        immediately."""
+        peer = (peer_addr or "").upper()
+        with self._lock:
+            link = self._links.get(peer)
+        if link is None:
+            self._clog("warn", "listener.unknown_peer",
+                       f"Inbound SPP from {peer} on channel {channel} "
+                       "has no enabled paired device; dropping",
+                       address=peer, channel=channel)
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return
+
+        if not link.offer_inbound(sock):
+            self._clog("debug", "listener.rejected",
+                       f"{peer} already has a live link; rejecting "
+                       f"duplicate inbound on channel {channel}",
+                       address=peer, channel=channel)
 
     def _start_link(self, address, port, channel, adapter_name):
         link = _DeviceLink(
