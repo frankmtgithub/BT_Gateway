@@ -1,228 +1,406 @@
-"""Device SPP server using BlueZ Profile1 D-Bus API.
+"""Device-side gateway: one outbound RFCOMM client per paired scanner.
 
-Registers an SPP (Serial Port Profile) service on the device adapter.
-When a remote device connects, BlueZ hands us the RFCOMM file descriptor
-through the Profile1.NewConnection callback.  A reader thread is spawned
-for each connected device to forward data to the message router.
+Mirrors :mod:`bt_gateway.plc_connection` on the devices side.  For every
+enabled paired scanner we run a dedicated manager thread that
 
-Because some devices (e.g. barcode scanners) also expose HID and will
-default to Bluetooth keyboard input that opens URLs in the user's
-browser, we actively disconnect the HID profile on connect so the data
-flows only through SPP to our router.
+1. binds ``/dev/rfcomm<N>`` to the scanner's BT address + RFCOMM channel,
+   and
+2. opens that TTY — which is what actually triggers the kernel to dial
+   the scanner over RFCOMM (exactly the way Hercules opening COM6 on
+   Windows triggers Windows's BT stack to dial the remote SPP server).
+
+While the TTY is open we read lines off it and push them to the router;
+when the link drops the manager releases the TTY fd, waits a backoff
+interval, and tries again.  Scanners that are still in HID-only mode
+(post-pair, pre-barcode-switch) just fail to dial and get retried quietly
+until the operator scans the vendor "switch to SPP" setup barcode.
+
+This replaces the old Profile1 / ``NewConnection`` server path.  The Pi
+is now the RFCOMM *client* for both the PLC and the scanners; the only
+difference is that the PLC is one device on the PLC adapter, while the
+scanners are N devices on the devices adapter.
 """
 
 import logging
 import os
-import socket
+import termios
 import threading
 import time
+import tty
 
-import dbus
-import dbus.service
+from bt_gateway import rfcomm_tty
 
 logger = logging.getLogger(__name__)
 
-try:
-    from socket import AF_BLUETOOTH, BTPROTO_RFCOMM
-except ImportError:
-    AF_BLUETOOTH = 31
-    BTPROTO_RFCOMM = 3
-
 SPP_UUID = "00001101-0000-1000-8000-00805f9b34fb"
 HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
-PROFILE_PATH_BASE = "/org/bluez/btgateway/spp_profile"
-RECV_BUFFER = 4096
 
-# How often the auto-connect thread probes enabled paired devices that
-# aren't currently connected.  Short enough that a scanner coming into
-# range establishes its SPP link within a few seconds without the user
-# having to click anything.
-AUTO_CONNECT_INTERVAL = 10
+# How long to wait between reconnect attempts on a scanner that is
+# currently unreachable (powered off, out of range, still in HID mode,
+# etc.).  The backoff ladder matches the PLC reconnect cadence so every
+# outbound link on this Pi behaves the same.
+DIAL_BACKOFF = [5, 10, 20, 40, 60]
 
-# Per-device exponential backoff after a failed ConnectProfile, so a
-# powered-off / out-of-range scanner doesn't get hammered every 10 s
-# (each failed attempt blocks BlueZ for ~5 s on a page timeout, which is
-# what starves concurrent pair/discovery calls).
-AUTO_CONNECT_BACKOFF = [30, 60, 120, 240, 480, 600]
+# TTY read timeout — the manager wakes up this often to check for
+# shutdown even if no data is arriving.
+READ_TIMEOUT = 1.0
 
-# While the user is pairing (or has just paired), stop touching BlueZ
-# on other devices so the pair flow has exclusive D-Bus access.  This
-# default can be overridden per-call.
+# While the user is pairing (or has just paired), pause every outbound
+# dial so BlueZ's D-Bus channel has exclusive access.
 DEFAULT_PAIR_GUARD_SECONDS = 90.0
 
 
-class DeviceConnection:
-    """Wraps a single RFCOMM connection to a remote device."""
+class _DeviceLink:
+    """One outbound RFCOMM-over-TTY connection to a single scanner.
 
-    def __init__(self, address, sock, on_data, on_disconnect, on_raw=None):
-        self.address = address
-        self._sock = sock
-        self._on_data = on_data
-        self._on_disconnect = on_disconnect
-        self._on_raw = on_raw
-        self._running = False
+    Owns the lifetime of ``/dev/rfcomm<port>`` for this device: binds it
+    on start, opens it in a loop (dialing), reads lines, notifies the
+    router, and releases the binding on stop.
+    """
+
+    def __init__(self, address, port, channel, adapter_name,
+                 config, router, bt_manager, conn_log, socketio):
+        self.address = address.upper()
+        self._port = int(port)
+        self._channel = int(channel) if channel else 0
+        self._adapter_name = adapter_name
+        self._config = config
+        self._router = router
+        self._bt_manager = bt_manager
+        self._conn_log = conn_log
+        self._socketio = socketio
+
+        self._fd = None
+        self._fd_lock = threading.Lock()
         self._thread = None
-        self._send_lock = threading.Lock()
+        self._running = False
+        self._registered = False
+        self._fail_count = 0
+        self._next_attempt = 0.0
+
+    # ── Lifecycle ──────────────────────────────────────────────────────
 
     def start(self):
+        if self._thread and self._thread.is_alive():
+            return
         self._running = True
         self._thread = threading.Thread(
-            target=self._read_loop, daemon=True,
-            name=f"device-{self.address}"
+            target=self._run,
+            daemon=True,
+            name=f"device-link-{self.address}",
         )
         self._thread.start()
 
     def stop(self):
         self._running = False
-        try:
-            self._sock.close()
-        except OSError:
-            pass
+        self._close_fd()
+        rfcomm_tty.release(self._port)
         if self._thread:
             self._thread.join(timeout=3)
+            self._thread = None
+        self._unregister_from_router()
+
+    # ── Router-facing send ─────────────────────────────────────────────
 
     def send(self, data):
-        """Send raw data to the device (newline-terminated)."""
-        with self._send_lock:
+        """Write newline-terminated ``data`` out to the scanner."""
+        with self._fd_lock:
+            fd = self._fd
+            if fd is None:
+                return False
             try:
                 payload = data if isinstance(data, str) else str(data)
-                self._sock.sendall((payload + "\n").encode("utf-8"))
+                os.write(fd, (payload + "\n").encode("utf-8"))
                 return True
             except OSError as e:
-                logger.error("Send to device %s failed: %s", self.address, e)
+                logger.error("Write to %s failed: %s", self.address, e)
                 return False
 
-    def _read_loop(self):
-        buffer = ""
-        while self._running:
-            try:
-                data = self._sock.recv(RECV_BUFFER)
-                if not data:
-                    logger.info("Device %s disconnected (EOF)", self.address)
-                    break
-                decoded = data.decode("utf-8", errors="replace")
-                # Debug / raw chunk notification
-                if self._on_raw is not None:
-                    try:
-                        self._on_raw(self.address, decoded)
-                    except Exception:
-                        logger.exception("on_raw callback failed")
-                buffer += decoded
-                # Process complete lines (newline-delimited)
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if line:
-                        self._on_data(self.address, line)
-            except socket.timeout:
-                continue
-            except OSError as e:
-                if self._running:
-                    logger.error("Device %s read error: %s", self.address, e)
-                break
-
-        self._running = False
-        self._on_disconnect(self.address)
-
-
-class SPPProfile(dbus.service.Object):
-    """BlueZ Profile1 implementation for the SPP server.
-
-    One instance is registered per RFCOMM channel that at least one enabled
-    paired device wants to listen on.  BlueZ calls NewConnection on the
-    instance whose channel matches the one the remote device hit.
-    """
-
-    def __init__(self, bus, path, channel, owner):
-        """``owner`` is the :class:`DeviceServer` that created us.  We route
-        the accepted connections back to it so it can keep a single
-        address → DeviceConnection map shared across every channel."""
-        self._channel = int(channel)
-        self._owner = owner
-        super().__init__(bus, path)
+    @property
+    def port(self):
+        return self._port
 
     @property
     def channel(self):
         return self._channel
 
-    @dbus.service.method("org.bluez.Profile1",
-                         in_signature="oha{sv}", out_signature="")
-    def NewConnection(self, device_path, fd, fd_properties):
-        """Called by BlueZ when a device connects to our SPP service."""
-        # Extract address from device path: /org/bluez/hciX/dev_AA_BB_CC_DD_EE_FF
-        addr_part = device_path.split("/")[-1]
-        if addr_part.startswith("dev_"):
-            address = addr_part[4:].replace("_", ":").upper()
-        else:
-            address = addr_part
+    @property
+    def is_connected(self):
+        return self._fd is not None
 
-        logger.info("New device connection from %s on channel %d (path: %s)",
-                    address, self._channel, device_path)
-        self._owner._clog(
-            "info", "spp.newconnection",
-            f"Incoming RFCOMM from {address} on channel {self._channel}",
-            address=address, channel=self._channel,
-        )
+    # ── Main loop ──────────────────────────────────────────────────────
 
-        # Take ownership of the file descriptor
-        if hasattr(fd, "take"):
-            fd_num = fd.take()
-        else:
-            fd_num = int(fd)
+    def _run(self):
+        # Discover the scanner's actual SPP channel once before we start
+        # dialing.  The per-device listen_channel in config is used only
+        # as an override when SDP fails.
+        resolved_channel = self._resolve_channel()
+        if not resolved_channel:
+            self._clog("warn", "device.dial.no_channel",
+                       f"{self.address}: no SPP channel known yet, will "
+                       "keep retrying.  Switch the scanner to SPP mode.",
+                       address=self.address)
 
-        # Gate: is this connection allowed?  We check gating BEFORE turning
-        # the fd into a socket so the reject path is a single close().
-        reason = self._owner.check_connection_allowed(address, self._channel)
-        if reason:
-            logger.warning("Rejecting connection from %s on channel %d: %s",
-                           address, self._channel, reason)
-            self._owner._clog(
-                "warn", "spp.rejected",
-                f"Rejected {address} on channel {self._channel}: {reason}",
-                address=address, channel=self._channel, reason=reason,
-            )
+        while self._running:
+            now = time.monotonic()
+            if now < self._next_attempt:
+                time.sleep(min(1.0, self._next_attempt - now))
+                continue
+
+            # If the scanner has been set to pair-guard or disabled mid-run,
+            # the outer DeviceServer will have called stop() on us already.
+            channel = resolved_channel or self._channel
+            if not channel:
+                # Keep probing SDP in case the scanner finally advertises
+                # SPP (firmware mode change), but do it slowly.
+                self._schedule_retry()
+                continue
+
+            # Make sure the TTY binding matches our target and exists.
+            if not rfcomm_tty.bind(self._port, self.address, channel):
+                self._clog("warn", "rfcomm.bind_fail",
+                           f"rfcomm bind /dev/rfcomm{self._port} → "
+                           f"{self.address} ch{channel} failed",
+                           address=self.address, channel=channel)
+                self._schedule_retry()
+                continue
+
+            # Trust the device so BlueZ doesn't pop an authorisation prompt
+            # on every dial.
             try:
-                os.close(fd_num)
-            except OSError:
+                self._bt_manager.set_device_trusted(
+                    self.address, True, self._adapter_name,
+                )
+            except Exception:
                 pass
-            return
 
-        # Create a socket from the file descriptor
+            self._clog("info", "device.dial",
+                       f"Dialing /dev/rfcomm{self._port} → {self.address} "
+                       f"ch{channel}",
+                       address=self.address, channel=channel)
+
+            fd = self._open_tty()
+            if fd is None:
+                # Dial failed — scanner asleep, out of range, or still in
+                # HID-only mode.  Back off and retry.
+                self._register_failure(channel)
+                continue
+
+            # Dial succeeded — we have a live RFCOMM link.
+            self._fail_count = 0
+            self._next_attempt = 0.0
+            with self._fd_lock:
+                self._fd = fd
+
+            self._register_with_router()
+            self._clog("info", "device.connected",
+                       f"{self.address} connected on /dev/rfcomm{self._port} "
+                       f"(channel {channel})",
+                       address=self.address, channel=channel)
+            self._emit_connected()
+
+            # Opportunistic: a scanner that just accepted SPP often still
+            # has a dangling HID profile from pairing.  Drop it so the Pi
+            # doesn't also receive scans as keystrokes.
+            try:
+                self._bt_manager.disconnect_profile(
+                    self.address, HID_UUID, self._adapter_name,
+                )
+            except Exception:
+                pass
+
+            try:
+                self._read_loop(fd)
+            finally:
+                self._close_fd()
+                self._unregister_from_router()
+                self._emit_disconnected()
+                self._clog("info", "device.disconnected",
+                           f"{self.address} disconnected "
+                           f"from /dev/rfcomm{self._port}",
+                           address=self.address, channel=channel)
+
+            # Brief pause before redialing so we don't spin on a flapping
+            # link.  If the link was healthy and just closed we reconnect
+            # quickly; repeated failures will re-escalate the backoff.
+            if self._running:
+                time.sleep(1.0)
+
+        # Clean exit.
+        rfcomm_tty.release(self._port)
+
+    def _resolve_channel(self):
+        """Return the RFCOMM channel to dial on the scanner.
+
+        Preference order: live SDP lookup → per-device configured
+        ``listen_channel`` override → None.
+        """
         try:
-            sock = socket.fromfd(fd_num, AF_BLUETOOTH, socket.SOCK_STREAM, BTPROTO_RFCOMM)
-            os.close(fd_num)  # fromfd dups the fd
+            ch = self._bt_manager.sdp_find_spp_channel(self.address)
+        except Exception:
+            ch = None
+        if ch:
+            if ch != self._channel:
+                self._clog("info", "device.sdp",
+                           f"SDP: {self.address} advertises SPP on "
+                           f"channel {ch}",
+                           address=self.address, channel=ch)
+            return int(ch)
+        if self._channel:
+            self._clog("debug", "device.sdp.fallback",
+                       f"SDP failed for {self.address}, using configured "
+                       f"channel {self._channel}",
+                       address=self.address, channel=self._channel)
+            return int(self._channel)
+        return None
+
+    def _open_tty(self):
+        """Open ``/dev/rfcomm<port>`` and put it into raw mode.
+
+        The open is blocking, which means the kernel completes the
+        RFCOMM dial before returning the fd — the same way
+        ``CreateFile("COM6")`` on Windows waits for the underlying
+        Bluetooth link to come up.  If the scanner is unreachable the
+        kernel raises after ~20 s with ``EHOSTDOWN`` /
+        ``ETIMEDOUT`` / ``ECONNREFUSED`` and we fall into the backoff
+        ladder.
+        """
+        path = rfcomm_tty.device_path(self._port)
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
         except OSError as e:
-            logger.error("Failed to create socket from fd for %s: %s", address, e)
+            self._clog("debug", "device.dial.fail",
+                       f"open({path}) failed: {e}",
+                       address=self.address)
+            return None
+
+        try:
+            tty.setraw(fd)
+        except (OSError, termios.error) as e:
+            logger.warning("Configuring TTY on %s failed: %s", path, e)
             try:
-                os.close(fd_num)
+                os.close(fd)
             except OSError:
                 pass
+            return None
+
+        return fd
+
+    def _read_loop(self, fd):
+        """Read newline-delimited data from the TTY until it closes."""
+        buffer = ""
+        while self._running:
+            try:
+                chunk = os.read(fd, 4096)
+            except BlockingIOError:
+                time.sleep(0.05)
+                continue
+            except OSError as e:
+                if self._running:
+                    logger.info("%s read error: %s", self.address, e)
+                break
+            if not chunk:
+                logger.info("%s EOF on /dev/rfcomm%d",
+                            self.address, self._port)
+                break
+
+            decoded = chunk.decode("utf-8", errors="replace")
+            try:
+                self._router.notify_device_raw(self.address, decoded)
+            except Exception:
+                logger.exception("notify_device_raw failed for %s",
+                                 self.address)
+            buffer += decoded
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.strip()
+                if line:
+                    try:
+                        self._router.route_from_device(self.address, line)
+                    except Exception:
+                        logger.exception("route_from_device failed for %s",
+                                         self.address)
+
+    def _close_fd(self):
+        with self._fd_lock:
+            fd = self._fd
+            self._fd = None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    # ── Router registration ────────────────────────────────────────────
+
+    def _register_with_router(self):
+        if self._registered:
             return
+        try:
+            self._router.register_device(self.address, self)
+            self._registered = True
+        except Exception:
+            logger.exception("register_device failed for %s", self.address)
 
-        self._owner.accept_connection(address, sock)
+    def _unregister_from_router(self):
+        if not self._registered:
+            return
+        try:
+            self._router.unregister_device(self.address)
+        except Exception:
+            logger.exception("unregister_device failed for %s", self.address)
+        self._registered = False
 
-    @dbus.service.method("org.bluez.Profile1",
-                         in_signature="o", out_signature="")
-    def RequestDisconnection(self, device_path):
-        addr_part = device_path.split("/")[-1]
-        if addr_part.startswith("dev_"):
-            address = addr_part[4:].replace("_", ":").upper()
-        else:
-            address = addr_part
-        logger.info("Disconnection requested for %s (channel %d)",
-                    address, self._channel)
-        self._owner.disconnect_device(address)
+    # ── Backoff ────────────────────────────────────────────────────────
 
-    @dbus.service.method("org.bluez.Profile1",
-                         in_signature="", out_signature="")
-    def Release(self):
-        logger.info("SPP Profile on channel %d released by BlueZ",
-                    self._channel)
+    def _register_failure(self, channel):
+        self._fail_count += 1
+        idx = min(self._fail_count - 1, len(DIAL_BACKOFF) - 1)
+        wait = DIAL_BACKOFF[idx]
+        self._next_attempt = time.monotonic() + wait
+        self._clog("debug", "device.dial.backoff",
+                   f"Dial to {self.address} failed "
+                   f"{self._fail_count}×; next attempt in {wait}s",
+                   address=self.address, channel=channel)
+
+    def _schedule_retry(self):
+        self._next_attempt = time.monotonic() + DIAL_BACKOFF[0]
+
+    # ── Helpers ────────────────────────────────────────────────────────
+
+    def _emit_connected(self):
+        if not self._socketio:
+            return
+        name = self._config.get_device_name(self.address) or self.address
+        self._socketio.emit("device_connected", {
+            "address": self.address,
+            "name": name,
+        }, namespace="/")
+
+    def _emit_disconnected(self):
+        if not self._socketio:
+            return
+        name = self._config.get_device_name(self.address) or self.address
+        self._socketio.emit("device_disconnected", {
+            "address": self.address,
+            "name": name,
+        }, namespace="/")
+
+    def _clog(self, level, step, detail, **kw):
+        if self._conn_log is None:
+            return
+        getattr(self._conn_log, level)(step, detail, **kw)
 
 
 class DeviceServer:
-    """Manages the SPP server lifecycle: per-channel profile registration,
-    device connection accounting, and pairing mode."""
+    """Tracks one outbound RFCOMM link per enabled paired scanner.
+
+    Lifecycle is driven by the config — :meth:`refresh_managers` brings
+    the running set of links into alignment with the enabled-devices
+    list.  Each link is a :class:`_DeviceLink` running in its own thread
+    and talking to the router via ``register_device`` /
+    ``route_from_device`` just like the old server path did.
+    """
 
     def __init__(self, config, router, bt_manager, socketio=None,
                  conn_log=None):
@@ -231,31 +409,12 @@ class DeviceServer:
         self._bt_manager = bt_manager
         self._socketio = socketio
         self._conn_log = conn_log
-        # channel (int) -> SPPProfile
-        self._profiles = {}
-        # BT address -> DeviceConnection
-        self._connections = {}
+        # BT address -> _DeviceLink
+        self._links = {}
         self._lock = threading.Lock()
         self._pairing_mode = False
         self._started = False
-        # Background auto-connect thread bringing enabled paired devices
-        # back onto SPP without user intervention (and killing HID so
-        # scanners don't act as keyboards).
-        self._auto_connect_thread = None
-        self._auto_connect_running = False
-        # Pair guard — while active, the auto-connect loop leaves every
-        # device alone so the user's pair attempt has exclusive D-Bus
-        # access (otherwise auto-connect's 5s page-timeouts cause Pair
-        # to return NoReply / AuthenticationTimeout).  Value is the
-        # monotonic deadline until which the guard is active.
         self._pair_guard_until = 0.0
-        # Per-address next-allowed monotonic time for auto-connect
-        # ConnectProfile attempts.  Populated by exponential backoff on
-        # failure; cleared on a successful accept.
-        self._auto_connect_next = {}
-        # How many consecutive failures each address has — drives the
-        # AUTO_CONNECT_BACKOFF index.
-        self._auto_connect_fails = {}
 
     def _clog(self, level, step, detail, **kw):
         if self._conn_log is None:
@@ -265,418 +424,141 @@ class DeviceServer:
     # ── Lifecycle ──────────────────────────────────────────────────────
 
     def start(self):
-        """Power on the device adapter and register SPP profiles for every
-        enabled paired device's listen channel."""
+        """Power on the device adapter, clear stale RFCOMM bindings, and
+        start a _DeviceLink for every enabled paired device."""
         adapter_name = self._config.get("device_adapter", "")
         if not adapter_name:
             logger.warning("No device adapter configured")
             return False
 
+        if not rfcomm_tty.have_rfcomm():
+            logger.error(
+                "The 'rfcomm' utility is not installed; per-device TTYs "
+                "cannot be created.  Install bluez-utils."
+            )
+            self._clog("error", "rfcomm.missing",
+                       "rfcomm(1) not found on PATH; install bluez-utils")
+            return False
+
+        # Nuke any leftover bindings from a previous run so we don't
+        # accidentally keep a scanner pinned to the wrong channel.
+        rfcomm_tty.release_all()
+
         self._bt_manager.power_adapter(adapter_name, True)
         self._started = True
-        self.refresh_profiles()
-        self._start_auto_connect()
+        self.refresh_managers()
         return True
 
     def stop(self):
-        self._auto_connect_running = False
-        self.disconnect_all()
-        self._unregister_all_profiles()
-        self.set_pairing_mode(False)
         self._started = False
-        if self._auto_connect_thread:
-            self._auto_connect_thread.join(timeout=3)
-            self._auto_connect_thread = None
+        self.disconnect_all()
+        self.set_pairing_mode(False)
+        rfcomm_tty.release_all()
 
-    # ── Profile registration (one per listen channel in use) ───────────
+    # ── Manager set ────────────────────────────────────────────────────
 
-    def refresh_profiles(self):
-        """Recompute the set of RFCOMM channels we need to listen on from
-        the enabled-devices list and bring registrations into alignment.
-
-        Always called after any change to devices, enabled flags, or
-        listen channels so the BlueZ SDP record reflects reality.
-        """
+    def refresh_managers(self):
+        """Bring the running set of links into alignment with the current
+        enabled-devices config."""
         if not self._started:
             return
 
-        desired = set()
+        adapter_name = self._config.get("device_adapter", "")
+        desired = {}
         for addr, dev in self._config.get_enabled_devices().items():
             if self._is_plc_paired_address(addr):
-                # Never expose SPP for a device that's paired on the PLC
-                # adapter — that device belongs to the PLC side.
+                continue
+            port = dev.get("port")
+            if port is None:
+                # Deterministic /dev/rfcomm<N> is core to this design —
+                # the config auto-assigns one at pair time, so it should
+                # always be set.  Skip if it's somehow missing.
+                self._clog("warn", "device.skip.no_port",
+                           f"Skipping {addr}: no /dev/rfcomm port assigned",
+                           address=addr)
                 continue
             channel = int(dev.get("listen_channel") or 0)
-            if 1 <= channel <= 30:
-                desired.add(channel)
+            desired[addr.upper()] = (int(port), channel)
 
         with self._lock:
-            current = set(self._profiles.keys())
+            current = set(self._links.keys())
+        desired_addrs = set(desired.keys())
 
-        # Register any newly-needed channels
-        for channel in sorted(desired - current):
-            self._register_profile(channel)
+        # Stop links that are no longer wanted or whose target changed.
+        for addr in sorted(current):
+            old = self._links[addr]
+            if addr not in desired_addrs:
+                self._stop_link(addr)
+                continue
+            port, channel = desired[addr]
+            if old.port != port or old.channel != channel:
+                self._stop_link(addr)
 
-        # Unregister channels we no longer need
-        for channel in sorted(current - desired):
-            self._unregister_profile(channel)
-
-    def _register_profile(self, channel):
-        path = f"{PROFILE_PATH_BASE}_ch{channel}"
-        try:
-            profile = SPPProfile(self._bt_manager.bus, path, channel, self)
-            manager = dbus.Interface(
-                self._bt_manager.bus.get_object("org.bluez", "/org/bluez"),
-                "org.bluez.ProfileManager1",
-            )
-            opts = {
-                "Name": dbus.String(f"BT Gateway SPP (ch{channel})"),
-                "Role": dbus.String("server"),
-                "Channel": dbus.UInt16(channel),
-                "AutoConnect": dbus.Boolean(False),
-                "RequireAuthentication": dbus.Boolean(False),
-                "RequireAuthorization": dbus.Boolean(False),
-            }
-            manager.RegisterProfile(path, SPP_UUID, opts)
+        # (Re)start links that should be running.
+        for addr, (port, channel) in desired.items():
             with self._lock:
-                self._profiles[channel] = profile
-            logger.info("SPP profile registered on RFCOMM channel %d", channel)
-            self._clog("info", "profile.register",
-                       f"SPP listener armed on RFCOMM channel {channel}",
-                       channel=channel)
-        except dbus.DBusException as e:
-            logger.error("Failed to register SPP profile on channel %d: %s",
-                         channel, e)
-            self._clog("error", "profile.register.fail",
-                       f"RegisterProfile on channel {channel} failed: {e}",
-                       channel=channel)
+                already = addr in self._links
+            if already:
+                continue
+            self._start_link(addr, port, channel, adapter_name)
 
-    def _unregister_profile(self, channel):
+    def _start_link(self, address, port, channel, adapter_name):
+        link = _DeviceLink(
+            address=address,
+            port=port,
+            channel=channel,
+            adapter_name=adapter_name,
+            config=self._config,
+            router=self._router,
+            bt_manager=self._bt_manager,
+            conn_log=self._conn_log,
+            socketio=self._socketio,
+        )
         with self._lock:
-            profile = self._profiles.pop(channel, None)
-        if profile is None:
+            self._links[address] = link
+        self._clog("info", "device.manager.start",
+                   f"Manager started for {address} on /dev/rfcomm{port} "
+                   f"(channel {channel or 'auto'})",
+                   address=address, channel=channel)
+        link.start()
+
+    def _stop_link(self, address):
+        with self._lock:
+            link = self._links.pop(address, None)
+        if link is None:
             return
-        path = f"{PROFILE_PATH_BASE}_ch{channel}"
-        try:
-            manager = dbus.Interface(
-                self._bt_manager.bus.get_object("org.bluez", "/org/bluez"),
-                "org.bluez.ProfileManager1",
-            )
-            manager.UnregisterProfile(path)
-            logger.info("SPP profile unregistered on RFCOMM channel %d", channel)
-            self._clog("info", "profile.unregister",
-                       f"SPP listener torn down on channel {channel}",
-                       channel=channel)
-        except dbus.DBusException as e:
-            logger.warning("UnregisterProfile on channel %d failed: %s",
-                           channel, e)
-            self._clog("warn", "profile.unregister.fail",
-                       f"UnregisterProfile on channel {channel} failed: {e}",
-                       channel=channel)
-        try:
-            profile.remove_from_connection()
-        except Exception:
-            pass
-
-    def _unregister_all_profiles(self):
-        with self._lock:
-            channels = list(self._profiles.keys())
-        for channel in channels:
-            self._unregister_profile(channel)
-
-    # ── Connection gate (called by SPPProfile.NewConnection) ───────────
-
-    def check_connection_allowed(self, address, channel):
-        """Return None if the device is allowed to connect on this channel,
-        otherwise a short human-readable reason string.
-
-        Enforces a per-channel exclusivity rule: each RFCOMM channel is
-        owned by exactly one paired address.  A channel advertised for
-        device A is closed to every other address, even if they are
-        paired.  That way a second scanner accidentally set to the same
-        SPP channel can't pre-empt the real owner.
-        """
-        if self._is_plc_paired_address(address):
-            return "device is paired on PLC adapter"
-        devices = self._config.get_devices()
-        dev = devices.get(address)
-        if dev is None:
-            return "device not paired with this gateway"
-        if not dev.get("enabled", True):
-            return "device is disabled"
-        configured = int(dev.get("listen_channel") or 0)
-        if configured and configured != channel:
-            return (f"device configured for channel {configured}, "
-                    f"got {channel}")
-
-        # Reject if another enabled paired device claims this channel.
-        # This is a runtime defence; config-level uniqueness is also
-        # enforced in Config.set_device_listen_channel.
-        for other_addr, other_dev in devices.items():
-            if other_addr.upper() == address.upper():
-                continue
-            if not other_dev.get("enabled", True):
-                continue
-            if int(other_dev.get("listen_channel") or 0) == int(channel):
-                return (f"channel {channel} is owned by another device "
-                        f"({other_addr})")
-        return None
-
-    def accept_connection(self, address, sock):
-        """Finalise an accepted SPP connection from a remote device."""
-        # Auto-register the device if it isn't in config yet.  (Shouldn't
-        # happen — check_connection_allowed rejects unknowns — but keep as
-        # a safety net so we never drop data.)
-        device_entry = self._config.add_device(address)
-        device_name = device_entry["name"] if isinstance(device_entry, dict) \
-            else device_entry
-
-        self._clog("info", "spp.accept",
-                   f"SPP accepted from {device_name} ({address})",
+        link.stop()
+        self._clog("info", "device.manager.stop",
+                   f"Manager stopped for {address}",
                    address=address)
 
-        # Clear auto-connect backoff state: this scanner is clearly alive.
-        with self._lock:
-            self._auto_connect_next.pop(address, None)
-            self._auto_connect_fails.pop(address, None)
-
-        # HID scanners announce both SPP and HID.  BlueZ will usually bring
-        # up both, meaning scan events are sent to the OS as keystrokes
-        # (which is why scanning opens a browser URL).  Disconnect HID so
-        # the data stays on our SPP channel only.
-        adapter_name = self._config.get("device_adapter", "")
-        self._bt_manager.disconnect_profile(address, HID_UUID, adapter_name)
-
-        conn = DeviceConnection(
-            address=address,
-            sock=sock,
-            on_data=self._on_device_data,
-            on_disconnect=self._on_device_disconnect,
-            on_raw=self._on_device_raw,
-        )
-
-        with self._lock:
-            old_conn = self._connections.get(address)
-            if old_conn:
-                logger.info("Replacing existing connection from %s", address)
-                old_conn.stop()
-            self._connections[address] = conn
-
-        self._router.register_device(address, conn)
-        conn.start()
-
-        logger.info("Device %s (%s) connected and receiving", address, device_name)
-        if self._socketio:
-            self._socketio.emit("device_connected", {
-                "address": address,
-                "name": device_name,
-            }, namespace="/")
-
-    # ── Connection accounting ──────────────────────────────────────────
-
-    def _on_device_data(self, address, data):
-        self._router.route_from_device(address, data)
-
-    def _on_device_raw(self, address, raw_chunk):
-        self._router.notify_device_raw(address, raw_chunk)
-
-    def _on_device_disconnect(self, address):
-        self.disconnect_device(address)
+    # ── Disconnect surface used by routes ──────────────────────────────
 
     def disconnect_device(self, address):
+        """Force a disconnect on a specific device.  The link's manager
+        thread will immediately attempt to redial, so this is really just
+        a 'reset the TTY' button from the UI's perspective."""
+        address = address.upper()
         with self._lock:
-            conn = self._connections.pop(address, None)
-        if conn:
-            conn.stop()
-        self._router.unregister_device(address)
-        device_name = self._config.get_device_name(address) or address
-        logger.info("Device %s (%s) disconnected", address, device_name)
-        self._clog("info", "spp.disconnect",
-                   f"SPP disconnected: {device_name} ({address})",
-                   address=address)
-        if self._socketio:
-            self._socketio.emit("device_disconnected", {
-                "address": address,
-                "name": device_name,
-            }, namespace="/")
+            link = self._links.get(address)
+        if link is None:
+            return
+        link._close_fd()  # causes _read_loop to break
+        link._unregister_from_router()
 
     def disconnect_all(self):
         with self._lock:
-            addresses = list(self._connections.keys())
-        for addr in addresses:
-            self.disconnect_device(addr)
+            addrs = list(self._links.keys())
+        for addr in addrs:
+            self._stop_link(addr)
 
     def get_active_connections(self):
         with self._lock:
-            return list(self._connections.keys())
+            return [a for a, l in self._links.items() if l.is_connected]
 
-    # ── Misc ───────────────────────────────────────────────────────────
-
-    def _is_plc_paired_address(self, address):
-        """True if ``address`` is the single PLC-paired device on the PLC
-        adapter.  Used to lock this device out of the devices side entirely."""
-        plc_adapter = self._config.get("plc_adapter", "")
-        if not plc_adapter:
-            return False
-        try:
-            plc_dev = self._bt_manager.get_single_paired_device(plc_adapter)
-        except Exception:
-            return False
-        if not plc_dev:
-            return False
-        return plc_dev.get("address", "").upper() == address.upper()
-
-    # ── Auto-connect loop ──────────────────────────────────────────────
-
-    def _start_auto_connect(self):
-        """Spawn a background thread that periodically nudges enabled
-        paired devices onto SPP when they aren't currently connected.
-
-        Scanners that are configured for SPP mode typically wait for the
-        host (the Pi) to initiate the RFCOMM connection rather than doing
-        it themselves, so calling BlueZ ``ConnectProfile(SPP)`` from our
-        side is what brings the link up without the user clicking
-        "connect" in the desktop Bluetooth applet.  We also hammer
-        ``DisconnectProfile(HID)`` so a scanner that's still in keyboard
-        mode doesn't leave stray HID state connected on the gateway.
-        """
-        if self._auto_connect_thread and self._auto_connect_thread.is_alive():
-            return
-        self._auto_connect_running = True
-        self._auto_connect_thread = threading.Thread(
-            target=self._auto_connect_loop,
-            daemon=True,
-            name="device-auto-connect",
-        )
-        self._auto_connect_thread.start()
-
-    def _auto_connect_loop(self):
-        logger.info("Device auto-connect thread started (interval %ds)",
-                    AUTO_CONNECT_INTERVAL)
-        while self._auto_connect_running:
-            try:
-                self._auto_connect_tick()
-            except Exception:
-                logger.exception("auto-connect tick failed")
-            # Interruptible sleep
-            deadline = time.monotonic() + AUTO_CONNECT_INTERVAL
-            while self._auto_connect_running and time.monotonic() < deadline:
-                time.sleep(0.5)
-        logger.info("Device auto-connect thread stopped")
-
-    def _auto_connect_tick(self):
-        """One iteration of the auto-connect loop — called on a schedule."""
-        adapter_name = self._config.get("device_adapter", "")
-        if not adapter_name:
-            return
-
-        # If the user is mid-pair (or just paired), keep BlueZ idle so the
-        # pair D-Bus call doesn't queue behind our 5s page-timeouts.
-        now = time.monotonic()
-        if self._pairing_mode or now < self._pair_guard_until:
-            self._clog("debug", "auto.skip",
-                       "Auto-connect skipped (pair guard active)")
-            return
-
-        # Snapshot state under lock; then work outside it.
-        with self._lock:
-            connected = set(self._connections.keys())
-            next_allowed = dict(self._auto_connect_next)
-
-        for addr, dev in self._config.get_enabled_devices().items():
-            if self._is_plc_paired_address(addr):
-                continue
-            if addr in connected:
-                # Already happily streaming — just keep HID off in case
-                # BlueZ opportunistically reopened it in the background.
-                self._bt_manager.disconnect_profile(addr, HID_UUID, adapter_name)
-                # Healthy link clears any residual backoff.
-                with self._lock:
-                    self._auto_connect_next.pop(addr, None)
-                    self._auto_connect_fails.pop(addr, None)
-                continue
-            # Respect per-device backoff: don't keep hammering an offline
-            # scanner with 5-second page-timeout blocks.
-            deadline = next_allowed.get(addr, 0.0)
-            if deadline and now < deadline:
-                continue
-
-            channel = int(dev.get("listen_channel") or 0) or None
-            # If the device isn't currently advertising SPP (e.g. it's
-            # still in HID/keyboard mode, pre-barcode-switch), don't
-            # call ConnectProfile(SPP) — BlueZ will fail with
-            # br-connection-profile-unavailable AND can tear down the
-            # ACL link as a side effect, kicking the scanner off HID.
-            # Wait for the scanner to flip to SPP and initiate the
-            # RFCOMM connection into our listener instead.
-            try:
-                uuids = self._bt_manager.get_device_uuids(addr, adapter_name)
-            except Exception:
-                uuids = []
-            if uuids and SPP_UUID.lower() not in uuids:
-                self._clog("debug", "auto.skip.no_spp",
-                           f"Auto-connect skipped for {addr}: device does "
-                           "not advertise SPP (still in HID mode).",
-                           address=addr, channel=channel)
-                continue
-            logger.debug("Auto-connect: attempting SPP on %s", addr)
-            self._clog("debug", "auto.tick",
-                       f"Auto-connect: asking for SPP on {addr}",
-                       address=addr, channel=channel)
-            # Don't drop HID here.  If the scanner is still in HID
-            # (keyboard) mode — e.g. freshly paired and waiting for the
-            # operator to scan the "switch to SPP" barcode — kicking
-            # HID every 10 s would tear its link down repeatedly.
-            # HID is only dropped once the scanner has actually chosen
-            # SPP (see _on_new_connection).
-            ok = self._bt_manager.connect_profile(addr, SPP_UUID, adapter_name)
-            if ok:
-                with self._lock:
-                    self._auto_connect_next.pop(addr, None)
-                    self._auto_connect_fails.pop(addr, None)
-            else:
-                self._register_auto_connect_failure(addr, channel)
-
-    def _register_auto_connect_failure(self, address, channel=None):
-        """Bump the failure counter for ``address`` and push out its next
-        allowed attempt time using :data:`AUTO_CONNECT_BACKOFF`."""
-        with self._lock:
-            fails = self._auto_connect_fails.get(address, 0) + 1
-            self._auto_connect_fails[address] = fails
-            idx = min(fails - 1, len(AUTO_CONNECT_BACKOFF) - 1)
-            wait = AUTO_CONNECT_BACKOFF[idx]
-            self._auto_connect_next[address] = time.monotonic() + wait
-        self._clog("debug", "auto.backoff",
-                   f"ConnectProfile failed {fails}× for {address}; "
-                   f"next auto-connect attempt in {wait}s",
-                   address=address, channel=channel, fails=fails, wait=wait)
-
-    # ── Pair guard ─────────────────────────────────────────────────────
-
-    def begin_pair_guard(self, seconds=DEFAULT_PAIR_GUARD_SECONDS):
-        """Suspend auto-connect activity for a window so a user-initiated
-        pair has clean D-Bus access.  Idempotent — extending an active
-        guard just pushes the deadline out."""
-        deadline = time.monotonic() + max(1.0, float(seconds))
-        if deadline > self._pair_guard_until:
-            self._pair_guard_until = deadline
-            self._clog("info", "auto.pair_guard",
-                       f"Auto-connect paused for {int(seconds)}s "
-                       "while pairing runs")
-
-    def end_pair_guard(self):
-        """Clear the pair guard immediately (used by callers that know
-        the pair has finished)."""
-        if self._pair_guard_until:
-            self._pair_guard_until = 0.0
-            self._clog("info", "auto.pair_guard_off",
-                       "Auto-connect resumed (pair guard cleared)")
+    # ── Pairing mode ───────────────────────────────────────────────────
 
     def set_pairing_mode(self, enabled, adapter_name=None):
-        """Enable or disable pairing mode (discoverable + pairable).
-
-        ``adapter_name`` overrides the configured device adapter when provided.
-        """
         if not adapter_name:
             adapter_name = self._config.get("device_adapter", "")
         if not adapter_name:
@@ -701,7 +583,48 @@ class DeviceServer:
     def pairing_mode(self):
         return self._pairing_mode
 
+    # ── Pair guard ─────────────────────────────────────────────────────
+
+    def begin_pair_guard(self, seconds=DEFAULT_PAIR_GUARD_SECONDS):
+        """Suspend redial activity briefly so a user-initiated pair has
+        clean D-Bus access.  Idempotent."""
+        deadline = time.monotonic() + max(1.0, float(seconds))
+        if deadline > self._pair_guard_until:
+            self._pair_guard_until = deadline
+            self._clog("info", "auto.pair_guard",
+                       f"Outbound dials paused for {int(seconds)}s "
+                       "while pairing runs")
+
+    def end_pair_guard(self):
+        if self._pair_guard_until:
+            self._pair_guard_until = 0.0
+            self._clog("info", "auto.pair_guard_off",
+                       "Outbound dials resumed (pair guard cleared)")
+
+    # ── Helpers ────────────────────────────────────────────────────────
+
+    def _is_plc_paired_address(self, address):
+        plc_adapter = self._config.get("plc_adapter", "")
+        if not plc_adapter:
+            return False
+        try:
+            plc_dev = self._bt_manager.get_single_paired_device(plc_adapter)
+        except Exception:
+            return False
+        if not plc_dev:
+            return False
+        return plc_dev.get("address", "").upper() == address.upper()
+
+    # ── Back-compat ────────────────────────────────────────────────────
+
+    # Routes still call refresh_profiles() after config edits; keep the
+    # old name as an alias so we don't have to touch every caller.
+    def refresh_profiles(self):
+        self.refresh_managers()
+
     @property
     def listening_channels(self):
+        """Return the list of currently-bound RFCOMM channels (one per
+        active link).  Exposed for the UI."""
         with self._lock:
-            return sorted(self._profiles.keys())
+            return sorted({l.channel for l in self._links.values() if l.channel})

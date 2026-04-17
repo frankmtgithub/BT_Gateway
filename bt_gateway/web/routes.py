@@ -321,28 +321,23 @@ def api_pair_device():
             entry = current_app.gateway_config.add_device(address)
             name = entry["name"] if isinstance(entry, dict) else entry
             port = entry["port"] if isinstance(entry, dict) else None
-            # Bring up the SPP listener on the device's configured
-            # channel so the scanner lands on the same /dev/rfcomm<N>
-            # every time it flips to SPP mode.
-            current_app.device_server.refresh_profiles()
+            # Tell the device server to (re)start this device's outbound
+            # RFCOMM link manager.  The manager binds /dev/rfcomm<port>
+            # and dials the scanner on its SPP channel — that's what
+            # establishes the serial connection, same pattern as opening
+            # a virtual COM port on Windows.
+            current_app.device_server.refresh_managers()
 
             hint = None
             if has_spp:
-                # Scanner is already in SPP mode — the BT radio is
-                # still briefly awake right after Pair() completes, so
-                # nudge it onto our SPP listener immediately instead
-                # of letting it sleep and rely on auto-reconnect.
-                current_app.bt_manager.connect_profile(
-                    address, SPP_UUID, adapter_name
-                )
-                hint = ("Scanner already advertises SPP; the gateway "
-                        "is connecting to it now.")
+                hint = ("Scanner already advertises SPP; "
+                        "/dev/rfcomm%d will dial it." % port
+                        if port is not None
+                        else "Scanner already advertises SPP.")
             else:
                 # No SPP.  We cannot keep the scanner awake in HID mode
-                # on this Pi (BlueZ has no input plugin to consume
-                # HID), so trying Device1.Connect() just spams the log
-                # with br-connection-profile-unavailable.  Guide the
-                # operator instead:
+                # on this Pi (BlueZ has no input plugin to consume HID).
+                # Guide the operator to flip the scanner into SPP mode:
                 if clog:
                     clog.log(
                         "pair.hid_only",
@@ -352,7 +347,8 @@ def api_pair_device():
                         "'switch to SPP' setup barcode on the scanner "
                         "BEFORE pairing (or right now while it's still "
                         "briefly awake), then re-pair. Once the scanner "
-                        "advertises SPP it will auto-connect here.",
+                        "advertises SPP the gateway will dial it via "
+                        "/dev/rfcomm%s." % (port if port is not None else "N"),
                         level="warn",
                         address=address,
                     )

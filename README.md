@@ -121,7 +121,8 @@ bt_gateway/
   config.py          — Configuration management
   bt_manager.py      — BlueZ D-Bus adapter control
   plc_connection.py  — PLC SPP client (auto-reconnect)
-  device_server.py   — SPP server for devices (BlueZ Profile1)
+  device_server.py   — Per-scanner RFCOMM-over-TTY client managers
+  rfcomm_tty.py      — /dev/rfcomm<N> bind/release helpers (rfcomm(1))
   message_router.py  — Routes messages between PLC and devices
   web/
     app.py           — Flask application factory

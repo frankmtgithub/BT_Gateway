@@ -7,26 +7,30 @@ we don't re-derive them every session.
 ## High-level goal
 
 Raspberry Pi 5 hosts a BlueZ-based SPP gateway (`bt_gateway/`).  Two
-sides:
+sides, both run the gateway as the RFCOMM **client**:
 
 * **PLC side** — one adapter, one paired device (a Windows host running
-  a virtual COM port).  Gateway acts as RFCOMM client; SDP-discovers the
-  channel and opens a socket.  Already working.
-* **Devices side** — one adapter, N paired scanners / remote Pis.
-  Gateway acts as RFCOMM server (Profile1 on BlueZ), scanners initiate
-  the SPP connection to a per-device listen channel.  This is the flaky
-  path the user is debugging.
+  a virtual COM port).  Gateway dials into it via an `AF_BLUETOOTH`
+  socket on the SDP-discovered SPP channel.
+* **Devices side** — one adapter, N paired scanners.  For each enabled
+  paired scanner the gateway binds `/dev/rfcomm<N>` to the scanner's
+  address + channel and opens the TTY — opening the TTY is what makes
+  the kernel dial out over RFCOMM, mirroring Windows's "opening COM6
+  triggers the SPP connect".  One `_DeviceLink` manager thread per
+  scanner keeps the TTY open, redials on drop, and pushes data into the
+  router.
 
 ## What's in place
 
-* `device_server.DeviceServer` registers one `SPPProfile` per in-use
-  RFCOMM channel and keeps a per-address `DeviceConnection`.
-* Each paired device has a `listen_channel` (1–30) and an `enabled`
-  flag (`bt_gateway/config.py`).
-* Auto-connect loop in `DeviceServer` tries `ConnectProfile(SPP)` +
-  `DisconnectProfile(HID)` on every enabled paired device every 10 s.
-* `check_connection_allowed()` gates the `NewConnection` callback on
-  pairing status, enabled flag, and channel match.
+* `device_server._DeviceLink` — one per enabled paired scanner.  Binds
+  `/dev/rfcomm<port>` via `bt_gateway.rfcomm_tty.bind`, opens the TTY in
+  raw mode, read-loops it, and registers itself with the router so
+  `route_from_device` can push scans to the PLC.
+* `device_server.DeviceServer` — tracks the set of `_DeviceLink`
+  managers; `refresh_managers()` aligns them with
+  `config.get_enabled_devices()` whenever the config changes.
+* Each paired device has a `port` (`/dev/rfcomm<N>` assignment) and an
+  optional `listen_channel` override used only when SDP discovery fails.
 * `pairing_agent.PairingAgent` auto-approves every pairing request
   (Just Works).
 
@@ -201,11 +205,53 @@ Removed:
 * Handover-related bookkeeping in `_auto_connect_tick` and
   `accept_connection`.
 
+## Session 2026-04-17 — flip the devices side to RFCOMM-client-over-TTY
+
+Instead of the Pi listening for incoming SPP (Profile1 server) from the
+scanners, the gateway now dials **out** to each scanner, exactly the
+way Windows's virtual COM ports do — and exactly the way the PLC side
+already works.  The user's mental model: *"On Windows I open COM6 in
+Hercules and it dials out to the device.  We need the same for
+scanners."*
+
+Design:
+
+* `bt_gateway/rfcomm_tty.py` — thin wrapper around the `rfcomm(1)` CLI
+  (`bind`, `release`, `release all`, parse `rfcomm -a`).  Gives us real
+  `/dev/rfcomm<N>` character devices bound to each scanner.
+* `device_server._DeviceLink` — per-scanner manager thread.  Binds
+  `/dev/rfcomm<port>`, `os.open`s it (that's what triggers the RFCOMM
+  dial; the TTY is in `tty.setraw` mode for 8-bit clean, no echo),
+  read-loops bytes, splits on `\n`, pushes to `router.route_from_device`.
+  Backoff ladder (5/10/20/40/60 s) on failed dials so an off-range
+  scanner doesn't thrash.
+* `device_server.DeviceServer.refresh_managers()` — replaces the old
+  `refresh_profiles()`.  Spins up / stops / restarts `_DeviceLink`s to
+  match `config.get_enabled_devices()`.  Kept as `refresh_profiles()`
+  alias for route compatibility.
+* `DeviceServer.start()` calls `rfcomm_tty.release_all()` at boot so
+  stale bindings from a previous run don't pin scanners to wrong
+  channels.
+* Per-device channel is discovered via
+  `bt_manager.sdp_find_spp_channel`; the saved `listen_channel` in
+  config is only the fallback when SDP fails.
+
+Removed:
+
+* `SPPProfile` class, `NewConnection` / `RequestDisconnection` /
+  `Release` callbacks, `check_connection_allowed` gate, per-channel
+  profile (re)registration, the whole auto-connect loop, and the old
+  `DeviceConnection` socket wrapper.
+* Manual `ConnectProfile(SPP)` nudge in `routes.api_pair_device` —
+  the manager now handles dialing on its own the moment
+  `refresh_managers()` sees the new paired device.
+
 ## Repo pointers
 
 * Entry point: `run.py`
 * BT adapter layer: `bt_gateway/bt_manager.py`
-* SPP server: `bt_gateway/device_server.py`
+* Scanner RFCOMM-client managers + `/dev/rfcomm<N>` TTYs:
+  `bt_gateway/device_server.py` + `bt_gateway/rfcomm_tty.py`
 * Connection log: `bt_gateway/connection_log.py`
 * PLC RFCOMM client: `bt_gateway/plc_connection.py`
 * Web UI: `bt_gateway/web/templates/pairing.html` (connection log
