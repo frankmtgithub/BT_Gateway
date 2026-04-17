@@ -418,10 +418,12 @@ class _DeviceLink:
             self._schedule_retry()
             return None, channel
 
-        if not rfcomm_tty.bind(self._port, self.address, channel):
+        if not rfcomm_tty.bind(self._port, self.address, channel,
+                               adapter=self._adapter_name):
             self._clog("warn", "rfcomm.bind_fail",
                        f"rfcomm bind /dev/rfcomm{self._port} → "
-                       f"{self.address} ch{channel} failed",
+                       f"{self.address} ch{channel} on "
+                       f"{self._adapter_name or 'default adapter'} failed",
                        address=self.address, channel=channel)
             self._schedule_retry()
             return None, channel
@@ -445,7 +447,8 @@ class _DeviceLink:
 
         self._clog("info", "device.dial",
                    f"Dialing /dev/rfcomm{self._port} → {self.address} "
-                   f"ch{channel}",
+                   f"ch{channel} via "
+                   f"{self._adapter_name or 'default adapter'}",
                    address=self.address, channel=channel)
 
         fd = self._open_tty()

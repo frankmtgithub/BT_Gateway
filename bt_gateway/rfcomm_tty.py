@@ -30,8 +30,14 @@ def device_path(port):
     return f"/dev/rfcomm{int(port)}"
 
 
-def bind(port, address, channel):
+def bind(port, address, channel, adapter=None):
     """Bind ``/dev/rfcomm<port>`` to ``address`` RFCOMM ``channel``.
+
+    If ``adapter`` is given (e.g. ``"hci1"``) the binding uses that
+    adapter as the source — equivalent to ``rfcomm -i hci1 bind …`` on
+    the CLI.  Without it the kernel picks an adapter by BlueZ's default
+    policy, which on a multi-adapter Pi may not be the one the scanner
+    was paired on.
 
     Idempotent — if the binding already matches we return True without
     touching anything; if it exists with a different target we release it
@@ -46,19 +52,20 @@ def bind(port, address, channel):
     if current is not None:
         release(port)
 
-    result = subprocess.run(
-        ["rfcomm", "bind", str(int(port)), address, str(channel)],
-        capture_output=True,
-        text=True,
-    )
+    cmd = ["rfcomm"]
+    if adapter:
+        cmd += ["-i", str(adapter)]
+    cmd += ["bind", str(int(port)), address, str(channel)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         logger.warning(
-            "rfcomm bind %d %s %d failed: %s",
-            port, address, channel, result.stderr.strip(),
+            "rfcomm bind %d %s %d (adapter=%s) failed: %s",
+            port, address, channel, adapter or "default",
+            result.stderr.strip(),
         )
         return False
-    logger.info("Bound /dev/rfcomm%d → %s channel %d",
-                port, address, channel)
+    logger.info("Bound /dev/rfcomm%d → %s channel %d via %s",
+                port, address, channel, adapter or "default adapter")
     return True
 
 
