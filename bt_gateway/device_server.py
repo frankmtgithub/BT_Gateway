@@ -21,8 +21,10 @@ difference is that the PLC is one device on the PLC adapter, while the
 scanners are N devices on the devices adapter.
 """
 
+import fcntl
 import logging
 import os
+import select
 import termios
 import threading
 import time
@@ -40,6 +42,14 @@ HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
 # etc.).  The backoff ladder matches the PLC reconnect cadence so every
 # outbound link on this Pi behaves the same.
 DIAL_BACKOFF = [5, 10, 20, 40, 60]
+
+# Maximum time to wait for a single dial to complete.  We open the TTY
+# non-blocking and poll() for it to become writable; if the remote
+# doesn't answer within this window we treat it as unreachable and fall
+# into the backoff ladder.  Without this a scanner that pairs but never
+# brings up SPP (e.g. HID-only firmware, asleep post-pair) would hang
+# the open() indefinitely.
+DIAL_TIMEOUT = 15.0
 
 # TTY read timeout — the manager wakes up this often to check for
 # shutdown even if no data is arriving.
@@ -272,34 +282,71 @@ class _DeviceLink:
     def _open_tty(self):
         """Open ``/dev/rfcomm<port>`` and put it into raw mode.
 
-        The open is blocking, which means the kernel completes the
-        RFCOMM dial before returning the fd — the same way
-        ``CreateFile("COM6")`` on Windows waits for the underlying
-        Bluetooth link to come up.  If the scanner is unreachable the
-        kernel raises after ~20 s with ``EHOSTDOWN`` /
-        ``ETIMEDOUT`` / ``ECONNREFUSED`` and we fall into the backoff
-        ladder.
+        We use ``O_NONBLOCK`` so the open itself returns immediately;
+        the kernel completes the RFCOMM dial in the background and we
+        wait on ``poll()`` for the fd to become writable (connected) or
+        error out (remote rejected / unreachable).  This gives us an
+        explicit timeout — important because an RFCOMM dial to a device
+        that isn't listening on the channel (e.g. scanner in HID mode)
+        can otherwise hang the open indefinitely.
+
+        On success the fd is switched back to blocking mode and put
+        into TTY raw mode so 8-bit data flows through untouched (same
+        as ``CreateFile("COM6")`` on Windows).
         """
         path = rfcomm_tty.device_path(self._port)
         try:
-            fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+            fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         except OSError as e:
             self._clog("debug", "device.dial.fail",
                        f"open({path}) failed: {e}",
                        address=self.address)
             return None
 
+        # Wait for the RFCOMM dial to succeed or fail.
+        poll = select.poll()
+        poll.register(fd, select.POLLOUT | select.POLLERR | select.POLLHUP)
+        events = poll.poll(int(DIAL_TIMEOUT * 1000))
+        if not events:
+            self._clog("warn", "device.dial.timeout",
+                       f"Dial to {path} ({self.address}) timed out after "
+                       f"{DIAL_TIMEOUT:.0f}s; scanner may be asleep, out "
+                       "of range, or not listening on this channel.",
+                       address=self.address)
+            self._safe_close(fd)
+            return None
+
+        _, revents = events[0]
+        if revents & (select.POLLERR | select.POLLHUP) and not (
+            revents & select.POLLOUT
+        ):
+            self._clog("debug", "device.dial.fail",
+                       f"Dial to {path} ({self.address}) rejected by "
+                       "remote (POLLERR/POLLHUP).  Scanner likely doesn't "
+                       "advertise SPP on this channel.",
+                       address=self.address)
+            self._safe_close(fd)
+            return None
+
+        # Connected — switch back to blocking so os.read() waits for
+        # data instead of spinning on EAGAIN, then apply raw mode.
         try:
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
             tty.setraw(fd)
         except (OSError, termios.error) as e:
             logger.warning("Configuring TTY on %s failed: %s", path, e)
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            self._safe_close(fd)
             return None
 
         return fd
+
+    @staticmethod
+    def _safe_close(fd):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
     def _read_loop(self, fd):
         """Read newline-delimited data from the TTY until it closes."""
