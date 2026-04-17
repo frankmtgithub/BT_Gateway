@@ -15,6 +15,12 @@ services:
       - bt-gateway-data:/data
       # Host D-Bus system bus (required for BlueZ communication)
       - /var/run/dbus:/var/run/dbus
+      # Host /dev — so dynamically-created /dev/rfcomm<N> nodes from
+      # `rfcomm bind` are visible inside the container.  Without this
+      # the kernel creates the TTY on the host's devtmpfs but the
+      # container's /dev tmpfs stays empty and os.open() fails with
+      # ENOENT.
+      - /dev:/dev
 
     environment:
       - CONFIG_PATH=/data/config.json

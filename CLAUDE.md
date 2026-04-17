@@ -246,6 +246,37 @@ Removed:
   the manager now handles dialing on its own the moment
   `refresh_managers()` sees the new paired device.
 
+## Session 2026-04-17 (later) — Docker /dev namespacing bit us
+
+First field run of the RFCOMM-client rework showed every dial
+failing with
+``open(/dev/rfcomm1) failed: [Errno 2] No such file or directory``
+even though `rfcomm bind` reported success (no `rfcomm.bind_fail`
+entries in the log).
+
+Root cause: the container has its own `/dev` tmpfs.  `rfcomm bind`
+runs inside the container, creates the RFCOMM TTY node on the
+*host's* devtmpfs, but it never appears in the container's `/dev`.
+`privileged: true` grants device *access* via cgroup rules but does
+NOT share the `/dev` mount.
+
+Fix:
+
+* `docker-compose.yml` — added `- /dev:/dev` bind-mount so dynamic
+  RFCOMM TTY nodes created by `rfcomm bind` are visible inside the
+  container.
+* `device_server._DeviceLink._run()` — after `rfcomm_tty.bind`
+  reports success we now call `rfcomm_tty.tty_exists(port)` as a
+  sanity check.  If the node isn't there we emit a clear
+  `rfcomm.tty_missing` log entry telling the operator to mount
+  `/dev` into the container instead of chasing a mysterious ENOENT
+  on `os.open`.
+
+Operator action to pick this up on a running Pi:
+`docker compose up -d` (so compose *re-creates* the container with
+the new `/dev` bind-mount) — plain `docker compose restart` keeps
+the old mount set and the fix won't apply.
+
 ## Repo pointers
 
 * Entry point: `run.py`
