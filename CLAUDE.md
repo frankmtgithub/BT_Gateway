@@ -277,6 +277,39 @@ Operator action to pick this up on a running Pi:
 the new `/dev` bind-mount) — plain `docker compose restart` keeps
 the old mount set and the fix won't apply.
 
+## Session 2026-04-17 (even later) — listener needs SDP, so use BlueZ Profile1
+
+Field test of the hybrid listen+dial code showed the scanner still
+never connecting:
+
+* `pair.uuids` reported **0 UUIDs** — scanner registers no SDP.
+* Every `device.dial` timed out at 15 s — scanner is in SPP-Master
+  mode, it won't accept inbound RFCOMM.
+* Our raw `socket.listen()` on channel 1 was up, but the scanner
+  never dialed in either.
+
+Root cause: an SPP-Master scanner does an **SDP SerialPort lookup**
+on the host before dialing in.  A plain `AF_BLUETOOTH` + `listen()`
+doesn't publish an SDP record — BlueZ 5 disables the standalone SDP
+server by default, and `sdptool add` can't reach it.  Without a
+published SerialPort record, the scanner's SDP query returns empty
+and it gives up.
+
+Fix: replace the raw socket listener with a BlueZ **Profile1**
+registration in server role.  Profile1 does three things at once:
+
+1. Binds the RFCOMM channel.
+2. Publishes an SDP SerialPort record for that channel.
+3. Delivers accepted connections to us via `NewConnection(device,
+   fd, props)` so the dispatch path is unchanged — we wrap the fd
+   in a socket and hand it to the matching `_DeviceLink.offer_inbound`.
+
+`_SPPListener` is now a `dbus.service.Object` subclass with
+`NewConnection` / `RequestDisconnection` / `Release` methods; it's
+registered against `/org/bluez/bt_gateway/spp_ch<N>` on startup and
+unregistered on stop.  `DeviceServer._start_listener` passes the
+system bus from `bt_manager.bus` rather than the adapter address.
+
 ## Repo pointers
 
 * Entry point: `run.py`

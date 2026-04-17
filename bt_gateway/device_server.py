@@ -31,6 +31,9 @@ import threading
 import time
 import tty
 
+import dbus
+import dbus.service
+
 from bt_gateway import rfcomm_tty
 
 try:
@@ -67,25 +70,32 @@ READ_TIMEOUT = 1.0
 DEFAULT_PAIR_GUARD_SECONDS = 90.0
 
 
-class _SPPListener:
-    """Accepts inbound RFCOMM connections on one channel of the devices
-    adapter and dispatches each accepted socket by peer BT address.
+_PROFILE_PATH_BASE = "/org/bluez/bt_gateway/spp"
+
+
+class _SPPListener(dbus.service.Object):
+    """Registers a BlueZ Profile1 in server role on one RFCOMM channel.
+
+    SPP-Master scanners do an SDP SerialPort lookup on the host *before*
+    dialing in — if the Pi doesn't publish an SDP record the scanner
+    can't discover our channel and never connects.  BlueZ's Profile1
+    registration both publishes that SDP record and delivers accepted
+    connections to us via ``NewConnection`` (no standalone ``sdptool``
+    needed, which doesn't work out-of-the-box on modern BlueZ anyway).
 
     One listener is shared across every enabled scanner that uses the
-    same ``listen_channel``.  When a scanner dials in, :meth:`_run`
-    picks it up via ``accept()`` and calls the registered dispatch
-    callback, which looks up the owning :class:`_DeviceLink` and hands
-    the socket over.
+    same ``listen_channel``.  Each ``NewConnection`` is dispatched to
+    the owning :class:`_DeviceLink` by peer BT address.
     """
 
-    def __init__(self, adapter_address, channel, dispatch, conn_log=None):
-        self._adapter_address = (adapter_address or "").upper()
+    def __init__(self, channel, dispatch, bus, conn_log=None):
         self._channel = int(channel)
         self._dispatch = dispatch
+        self._bus = bus
         self._conn_log = conn_log
-        self._sock = None
-        self._thread = None
-        self._running = False
+        self._path = f"{_PROFILE_PATH_BASE}_ch{self._channel}"
+        self._registered = False
+        super().__init__(bus, self._path)
 
     @property
     def channel(self):
@@ -93,83 +103,125 @@ class _SPPListener:
 
     def start(self):
         try:
-            sock = socket.socket(AF_BLUETOOTH, socket.SOCK_STREAM,
-                                 BTPROTO_RFCOMM)
-            bind_addr = self._adapter_address or "00:00:00:00:00:00"
-            sock.bind((bind_addr, self._channel))
-            sock.listen(4)
-        except OSError as e:
-            logger.error("RFCOMM listen on ch%d failed: %s",
-                         self._channel, e)
-            self._clog("warn", "listener.start_fail",
-                       f"Cannot listen on RFCOMM channel {self._channel}: "
-                       f"{e}.  Incoming scanner connections won't be "
-                       "accepted on this channel.",
+            manager = dbus.Interface(
+                self._bus.get_object("org.bluez", "/org/bluez"),
+                "org.bluez.ProfileManager1",
+            )
+            opts = {
+                "Name": dbus.String(
+                    f"BT Gateway SPP (ch{self._channel})"),
+                "Role": dbus.String("server"),
+                "Channel": dbus.UInt16(self._channel),
+                "Service": dbus.String(SPP_UUID),
+                "AutoConnect": dbus.Boolean(False),
+                "RequireAuthentication": dbus.Boolean(False),
+                "RequireAuthorization": dbus.Boolean(False),
+            }
+            manager.RegisterProfile(self._path, SPP_UUID, opts)
+            self._registered = True
+            self._clog("info", "listener.start",
+                       f"SPP profile registered on RFCOMM channel "
+                       f"{self._channel}; SDP SerialPort record "
+                       "published so scanners can discover us",
                        channel=self._channel)
+            return True
+        except dbus.DBusException as e:
+            logger.error("RegisterProfile on ch%d failed: %s",
+                         self._channel, e)
+            self._clog("error", "listener.start_fail",
+                       f"RegisterProfile on channel {self._channel} "
+                       f"failed: {e}", channel=self._channel)
             try:
-                sock.close()
-            except OSError:
+                self.remove_from_connection()
+            except Exception:
                 pass
             return False
 
-        self._sock = sock
-        self._running = True
-        self._clog("info", "listener.start",
-                   f"Listening for inbound SPP on channel "
-                   f"{self._channel} (devices adapter)",
-                   channel=self._channel)
-        self._thread = threading.Thread(
-            target=self._run, daemon=True,
-            name=f"spp-listen-ch{self._channel}",
-        )
-        self._thread.start()
-        return True
-
     def stop(self):
-        self._running = False
-        sock = self._sock
-        self._sock = None
-        if sock is not None:
+        if self._registered:
             try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                sock.close()
-            except OSError:
-                pass
-        if self._thread:
-            self._thread.join(timeout=3)
-            self._thread = None
+                manager = dbus.Interface(
+                    self._bus.get_object("org.bluez", "/org/bluez"),
+                    "org.bluez.ProfileManager1",
+                )
+                manager.UnregisterProfile(self._path)
+            except dbus.DBusException as e:
+                logger.warning("UnregisterProfile ch%d failed: %s",
+                               self._channel, e)
+            self._registered = False
+        try:
+            self.remove_from_connection()
+        except Exception:
+            pass
         self._clog("info", "listener.stop",
                    f"Stopped listening on channel {self._channel}",
                    channel=self._channel)
 
-    def _run(self):
-        sock = self._sock
-        while self._running and sock is not None:
-            try:
-                client, addr = sock.accept()
-            except OSError:
-                if self._running:
-                    logger.exception(
-                        "accept() on RFCOMM ch%d failed", self._channel)
-                break
+    @dbus.service.method("org.bluez.Profile1",
+                         in_signature="oha{sv}", out_signature="")
+    def NewConnection(self, device_path, fd, fd_properties):
+        peer = self._address_from_path(str(device_path))
 
-            peer = (addr[0] if addr else "").upper()
-            self._clog("info", "listener.accept",
-                       f"Inbound SPP from {peer} on channel "
-                       f"{self._channel}",
+        if hasattr(fd, "take"):
+            fd_num = fd.take()
+        else:
+            fd_num = int(fd)
+
+        try:
+            sock = socket.fromfd(fd_num, AF_BLUETOOTH,
+                                 socket.SOCK_STREAM, BTPROTO_RFCOMM)
+        except OSError as e:
+            logger.error("Cannot wrap fd from BlueZ for %s: %s", peer, e)
+            self._clog("warn", "listener.fd_fail",
+                       f"Cannot wrap fd for {peer}: {e}",
                        address=peer, channel=self._channel)
-
             try:
-                self._dispatch(peer, client, self._channel)
-            except Exception:
-                logger.exception("dispatch failed for %s", peer)
-                try:
-                    client.close()
-                except OSError:
-                    pass
+                os.close(fd_num)
+            except OSError:
+                pass
+            return
+        # socket.fromfd dup()s the fd; close the original.
+        try:
+            os.close(fd_num)
+        except OSError:
+            pass
+
+        self._clog("info", "listener.accept",
+                   f"Inbound SPP from {peer} on channel "
+                   f"{self._channel}",
+                   address=peer, channel=self._channel)
+
+        try:
+            self._dispatch(peer, sock, self._channel)
+        except Exception:
+            logger.exception("dispatch failed for %s", peer)
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    @dbus.service.method("org.bluez.Profile1",
+                         in_signature="o", out_signature="")
+    def RequestDisconnection(self, device_path):
+        peer = self._address_from_path(str(device_path))
+        self._clog("info", "listener.disconnect_req",
+                   f"BlueZ requested disconnect for {peer} on channel "
+                   f"{self._channel}",
+                   address=peer, channel=self._channel)
+
+    @dbus.service.method("org.bluez.Profile1",
+                         in_signature="", out_signature="")
+    def Release(self):
+        self._clog("info", "listener.release",
+                   f"Profile on channel {self._channel} released by BlueZ",
+                   channel=self._channel)
+
+    @staticmethod
+    def _address_from_path(device_path):
+        tail = device_path.rsplit("/", 1)[-1]
+        if tail.startswith("dev_"):
+            return tail[4:].replace("_", ":").upper()
+        return tail.upper()
 
     def _clog(self, level, step, detail, **kw):
         if self._conn_log is None:
@@ -846,9 +898,9 @@ class DeviceServer:
 
     def _start_listener(self, channel):
         listener = _SPPListener(
-            adapter_address=self._adapter_address,
             channel=channel,
             dispatch=self._dispatch_incoming,
+            bus=self._bt_manager.bus,
             conn_log=self._conn_log,
         )
         if not listener.start():
