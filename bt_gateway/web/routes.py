@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import threading
+import time
 
 from flask import (
     Blueprint, Response, current_app, jsonify, render_template, request,
@@ -291,21 +292,26 @@ def api_pair_device():
         current_app.device_server.begin_pair_guard(90)
         success = current_app.bt_manager.pair_device(address, adapter_name)
         if success:
-            # What BlueZ thinks this scanner supports.  Logged as a
-            # diagnostic because "br-connection-profile-unavailable"
-            # errors almost always mean the scanner is in HID-only mode
-            # on a Pi whose BlueZ has no HID (input) plugin enabled —
-            # i.e. there's literally no profile handler on this host
-            # that can keep the scanner's link alive.
+            # What BlueZ thinks this scanner supports.  BlueZ runs an SDP
+            # browse on its own after Pair() returns and the UUIDs
+            # property arrives asynchronously; querying it immediately
+            # almost always returns an empty list.  Poll for a few
+            # seconds so the log entry reflects what the scanner really
+            # advertises instead of a race.
             uuids = []
-            try:
-                uuids = current_app.bt_manager.get_device_uuids(
-                    address, adapter_name
-                ) or []
-            except Exception:
-                pass
-            has_spp = SPP_UUID.lower() in uuids
-            has_hid = HID_UUID.lower() in uuids
+            deadline = time.monotonic() + 5.0
+            while True:
+                try:
+                    uuids = current_app.bt_manager.get_device_uuids(
+                        address, adapter_name
+                    ) or []
+                except Exception:
+                    uuids = []
+                if uuids or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.3)
+            has_spp = SPP_UUID.lower() in (u.lower() for u in uuids)
+            has_hid = HID_UUID.lower() in (u.lower() for u in uuids)
             clog = getattr(current_app, "conn_log", None)
             if clog:
                 clog.log(
@@ -329,15 +335,15 @@ def api_pair_device():
             current_app.device_server.refresh_managers()
 
             hint = None
+            port_label = str(port) if port is not None else "N"
             if has_spp:
                 hint = ("Scanner already advertises SPP; "
-                        "/dev/rfcomm%d will dial it." % port
-                        if port is not None
-                        else "Scanner already advertises SPP.")
-            else:
-                # No SPP.  We cannot keep the scanner awake in HID mode
-                # on this Pi (BlueZ has no input plugin to consume HID).
-                # Guide the operator to flip the scanner into SPP mode:
+                        "/dev/rfcomm%s will dial it." % port_label)
+            elif has_hid:
+                # Scanner is in HID mode and BlueZ knows about it.  On
+                # this Pi we have no input plugin, so we can't keep it
+                # alive as a keyboard — guide the operator to flip it
+                # into SPP mode.
                 if clog:
                     clog.log(
                         "pair.hid_only",
@@ -348,13 +354,37 @@ def api_pair_device():
                         "BEFORE pairing (or right now while it's still "
                         "briefly awake), then re-pair. Once the scanner "
                         "advertises SPP the gateway will dial it via "
-                        "/dev/rfcomm%s." % (port if port is not None else "N"),
+                        "/dev/rfcomm%s." % port_label,
                         level="warn",
                         address=address,
                     )
                 hint = ("Scanner is in HID-only mode. Scan the vendor "
                         "'switch to SPP' barcode on the scanner now "
                         "(it's briefly awake) and re-pair if needed.")
+            else:
+                # BlueZ returned no UUIDs at all even after the retry
+                # window — the scanner went back to sleep before BlueZ
+                # finished its post-pair SDP browse, or the remote
+                # simply refused the browse.  Don't claim HID-only here,
+                # that was the old bug: the warning was firing whenever
+                # the UUIDs list was empty and misleading the operator.
+                if clog:
+                    clog.log(
+                        "pair.no_profiles",
+                        f"{address} paired but BlueZ reports no profiles "
+                        "yet (SDP browse came back empty). The scanner "
+                        "probably went to sleep before BlueZ could query "
+                        "it. Wake it up (trigger press) and try again, "
+                        "or scan the vendor 'switch to SPP' barcode and "
+                        "re-pair. Once it advertises SPP the gateway "
+                        "will dial it via /dev/rfcomm%s." % port_label,
+                        level="warn",
+                        address=address,
+                    )
+                hint = ("Pairing succeeded but the scanner's SDP browse "
+                        "came back empty. Wake the scanner (trigger "
+                        "press) or flip it into SPP mode with the "
+                        "vendor setup barcode, then try again.")
             return jsonify({
                 "status": "paired", "name": name, "port": port,
                 "adapter": adapter_name,
