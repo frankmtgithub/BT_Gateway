@@ -21,10 +21,8 @@ difference is that the PLC is one device on the PLC adapter, while the
 scanners are N devices on the devices adapter.
 """
 
-import fcntl
 import logging
 import os
-import select
 import termios
 import threading
 import time
@@ -282,57 +280,56 @@ class _DeviceLink:
     def _open_tty(self):
         """Open ``/dev/rfcomm<port>`` and put it into raw mode.
 
-        We use ``O_NONBLOCK`` so the open itself returns immediately;
-        the kernel completes the RFCOMM dial in the background and we
-        wait on ``poll()`` for the fd to become writable (connected) or
-        error out (remote rejected / unreachable).  This gives us an
-        explicit timeout — important because an RFCOMM dial to a device
-        that isn't listening on the channel (e.g. scanner in HID mode)
-        can otherwise hang the open indefinitely.
-
-        On success the fd is switched back to blocking mode and put
-        into TTY raw mode so 8-bit data flows through untouched (same
-        as ``CreateFile("COM6")`` on Windows).
+        Linux's RFCOMM TTY driver doesn't honour ``O_NONBLOCK`` on
+        open — the open itself blocks until the kernel either completes
+        the RFCOMM SABM handshake or gives up.  For a scanner that
+        paired but never brought up SPP the kernel may never give up,
+        so we run the open in a short-lived worker thread and bail out
+        after :data:`DIAL_TIMEOUT`.  On timeout we release the RFCOMM
+        binding, which causes the kernel to fail any pending open with
+        ``ENODEV`` and lets the worker thread exit cleanly.
         """
         path = rfcomm_tty.device_path(self._port)
-        try:
-            fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-        except OSError as e:
-            self._clog("debug", "device.dial.fail",
-                       f"open({path}) failed: {e}",
-                       address=self.address)
-            return None
+        result: dict = {}
+        done = threading.Event()
 
-        # Wait for the RFCOMM dial to succeed or fail.
-        poll = select.poll()
-        poll.register(fd, select.POLLOUT | select.POLLERR | select.POLLHUP)
-        events = poll.poll(int(DIAL_TIMEOUT * 1000))
-        if not events:
+        def _worker():
+            try:
+                result["fd"] = os.open(path, os.O_RDWR | os.O_NOCTTY)
+            except OSError as e:
+                result["error"] = e
+            finally:
+                done.set()
+
+        threading.Thread(
+            target=_worker,
+            daemon=True,
+            name=f"dial-open-{self.address}",
+        ).start()
+
+        if not done.wait(DIAL_TIMEOUT):
             self._clog("warn", "device.dial.timeout",
                        f"Dial to {path} ({self.address}) timed out after "
                        f"{DIAL_TIMEOUT:.0f}s; scanner may be asleep, out "
                        "of range, or not listening on this channel.",
                        address=self.address)
-            self._safe_close(fd)
+            # Unstick the kernel — releasing the binding causes the
+            # pending open() to fail with ENODEV so the worker thread
+            # finishes.  We'll rebind on the next dial attempt.
+            rfcomm_tty.release(self._port)
+            done.wait(2.0)
+            if "fd" in result:
+                self._safe_close(result["fd"])
             return None
 
-        _, revents = events[0]
-        if revents & (select.POLLERR | select.POLLHUP) and not (
-            revents & select.POLLOUT
-        ):
+        if "error" in result:
             self._clog("debug", "device.dial.fail",
-                       f"Dial to {path} ({self.address}) rejected by "
-                       "remote (POLLERR/POLLHUP).  Scanner likely doesn't "
-                       "advertise SPP on this channel.",
+                       f"open({path}) failed: {result['error']}",
                        address=self.address)
-            self._safe_close(fd)
             return None
 
-        # Connected — switch back to blocking so os.read() waits for
-        # data instead of spinning on EAGAIN, then apply raw mode.
+        fd = result["fd"]
         try:
-            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-            fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
             tty.setraw(fd)
         except (OSError, termios.error) as e:
             logger.warning("Configuring TTY on %s failed: %s", path, e)
