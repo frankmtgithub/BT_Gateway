@@ -753,7 +753,6 @@ class DeviceServer:
         # that channel; an SPP-Master scanner dials in and we route by
         # peer BT address).
         self._listeners = {}
-        self._adapter_address = None
         self._lock = threading.Lock()
         self._pairing_mode = False
         self._started = False
@@ -788,16 +787,6 @@ class DeviceServer:
         rfcomm_tty.release_all()
 
         self._bt_manager.power_adapter(adapter_name, True)
-        self._adapter_address = self._resolve_adapter_address(adapter_name)
-        if self._adapter_address:
-            self._clog("info", "device.adapter",
-                       f"Devices adapter {adapter_name} = "
-                       f"{self._adapter_address}")
-        else:
-            self._clog("warn", "device.adapter.unknown",
-                       f"Could not resolve BT address of devices adapter "
-                       f"{adapter_name}; inbound SPP listener will bind "
-                       "to ANY adapter")
         self._started = True
         self.refresh_managers()
         return True
@@ -809,22 +798,6 @@ class DeviceServer:
         self.set_pairing_mode(False)
         rfcomm_tty.release_all()
 
-    def _resolve_adapter_address(self, adapter_name):
-        """Resolve an adapter name (e.g. hci1) to its BT address."""
-        try:
-            addr = self._bt_manager.get_adapter_address(adapter_name)
-            if addr:
-                return addr.upper()
-        except Exception:
-            pass
-        try:
-            path = f"/sys/class/bluetooth/{adapter_name}/address"
-            if os.path.exists(path):
-                with open(path) as f:
-                    return f.read().strip().upper()
-        except OSError:
-            pass
-        return None
 
     # ── Manager set ────────────────────────────────────────────────────
 
